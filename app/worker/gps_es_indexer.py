@@ -1,0 +1,81 @@
+"""GPS Elasticsearch indexer (worker job 1b).
+
+Second consumer group on the `gps_ingest` stream. Runs independently of the
+Postgres persister ([gps_consumer.py]) — each group gets its own copy of the
+stream, so Postgres (system of record) and ES (geo query layer) both receive
+every fix. Indexes each point as a geo_point doc for geo_distance / viewport /
+heatmap queries.
+"""
+
+import asyncio
+import logging
+
+from elasticsearch.helpers import async_bulk
+from redis.exceptions import ResponseError
+
+from app.core.elasticsearch import GPS_INDEX, ensure_gps_index, get_es_client
+from app.core.redis import GPS_ES_CONSUMER_GROUP, GPS_STREAM, get_redis_client
+
+logger = logging.getLogger("unitrack.worker.gps_es")
+
+CONSUMER_NAME = "gps-es-1"
+BATCH = 100
+BLOCK_MS = 5000
+
+
+def _to_float(v: str) -> float | None:
+    return float(v) if v not in ("", None) else None
+
+
+async def _ensure_group(r) -> None:
+    try:
+        await r.xgroup_create(GPS_STREAM, GPS_ES_CONSUMER_GROUP, id="0", mkstream=True)
+        logger.info("Created consumer group %s on %s", GPS_ES_CONSUMER_GROUP, GPS_STREAM)
+    except ResponseError as exc:
+        if "BUSYGROUP" not in str(exc):
+            raise
+
+
+def _to_doc(entry_id: str, fields: dict) -> dict:
+    # Stream carries lng; ES geo_point wants lon.
+    return {
+        "_index": GPS_INDEX,
+        "_id": entry_id,  # stream id = idempotent doc id (reprocess-safe)
+        "_source": {
+            "bus_id": fields["bus_id"],
+            "helper_id": fields.get("helper_id"),
+            "ts": fields["ts"],
+            "location": {"lat": float(fields["lat"]), "lon": float(fields["lng"])},
+            "speed": _to_float(fields.get("speed", "")),
+            "heading": _to_float(fields.get("heading", "")),
+            "accuracy": _to_float(fields.get("accuracy", "")),
+        },
+    }
+
+
+async def run() -> None:
+    r = get_redis_client()
+    es = get_es_client()
+    await _ensure_group(r)
+    await ensure_gps_index(es)
+    logger.info("GPS ES indexer running on stream %s", GPS_STREAM)
+    while True:
+        resp = await r.xreadgroup(
+            GPS_ES_CONSUMER_GROUP,
+            CONSUMER_NAME,
+            streams={GPS_STREAM: ">"},
+            count=BATCH,
+            block=BLOCK_MS,
+        )
+        if not resp:
+            continue
+        for _stream, entries in resp:
+            docs = [_to_doc(eid, fields) for eid, fields in entries]
+            await async_bulk(es, docs)
+            await r.xack(GPS_STREAM, GPS_ES_CONSUMER_GROUP, *[eid for eid, _ in entries])
+            logger.info("Indexed %d gps points to ES", len(docs))
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(run())

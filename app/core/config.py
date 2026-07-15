@@ -1,0 +1,52 @@
+from functools import lru_cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    env: str = "dev"
+
+    # Postgres
+    postgres_user: str = "unitrack"
+    postgres_password: str = "unitrack"
+    postgres_db: str = "unitrack"
+    postgres_host: str = "postgres"
+    postgres_port: int = 5432
+
+    # Redis
+    redis_host: str = "redis"
+    redis_port: int = 6379
+
+    # Elasticsearch — geo query/analytics layer for GPS (spec §5.1 revisit)
+    elasticsearch_url: str = "http://elasticsearch:9200"
+    gps_index: str = "gps_points"
+
+    # Auth
+    jwt_secret: str = "change-me-in-prod"
+    access_token_ttl_min: int = 15
+    refresh_token_ttl_days: int = 30
+
+    # Identity — varsity domain allow-list for student signup
+    allowed_student_email_domains: str = "ulab.edu.bd"
+
+    @property
+    def database_url(self) -> str:
+        return (
+            f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        )
+
+    @property
+    def student_email_domains(self) -> set[str]:
+        raw = self.allowed_student_email_domains.split(",")
+        return {d.strip().lower() for d in raw if d.strip()}
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()
