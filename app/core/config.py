@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     redis_host: str = "redis"
     redis_port: int = 6379
 
-    # Elasticsearch — geo query/analytics layer for GPS (spec §5.1 revisit)
+    # Elasticsearch
     elasticsearch_url: str = "http://elasticsearch:9200"
     gps_index: str = "gps_points"
 

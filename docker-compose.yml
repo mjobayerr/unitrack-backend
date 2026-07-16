@@ -32,8 +32,9 @@ services:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
     environment:
       discovery.type: single-node
-      xpack.security.enabled: "false"      # dev only — no TLS/auth
-      ES_JAVA_OPTS: "-Xms512m -Xmx512m"    # cap heap for a small VPS
+      xpack.security.enabled: "false"      
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"    
+      # 1Gb heap
     ports:
       - "9200:9200"
     volumes:

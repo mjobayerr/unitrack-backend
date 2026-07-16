@@ -1,10 +1,8 @@
 """GPS Elasticsearch indexer (worker job 1b).
 
-Second consumer group on the `gps_ingest` stream. Runs independently of the
-Postgres persister ([gps_consumer.py]) — each group gets its own copy of the
-stream, so Postgres (system of record) and ES (geo query layer) both receive
-every fix. Indexes each point as a geo_point doc for geo_distance / viewport /
-heatmap queries.
+The only consumer group on the `gps_ingest` stream: Elasticsearch is the sole
+GPS store (spec §5.1 deviation — see the README). Indexes each fix as a
+geo_point doc for geo_distance / viewport / heatmap queries.
 """
 
 import asyncio
@@ -12,15 +10,20 @@ import logging
 
 from elasticsearch.helpers import async_bulk
 from redis.exceptions import ResponseError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from app.core.elasticsearch import GPS_INDEX, ensure_gps_index, get_es_client
-from app.core.redis import GPS_ES_CONSUMER_GROUP, GPS_STREAM, get_redis_client
+from app.core.redis import (
+    GPS_BLOCK_MS,
+    GPS_ES_CONSUMER_GROUP,
+    GPS_STREAM,
+    get_redis_client,
+)
 
 logger = logging.getLogger("unitrack.worker.gps_es")
 
 CONSUMER_NAME = "gps-es-1"
 BATCH = 100
-BLOCK_MS = 5000
 
 
 def _to_float(v: str) -> float | None:
@@ -60,13 +63,18 @@ async def run() -> None:
     await ensure_gps_index(es)
     logger.info("GPS ES indexer running on stream %s", GPS_STREAM)
     while True:
-        resp = await r.xreadgroup(
-            GPS_ES_CONSUMER_GROUP,
-            CONSUMER_NAME,
-            streams={GPS_STREAM: ">"},
-            count=BATCH,
-            block=BLOCK_MS,
-        )
+        try:
+            resp = await r.xreadgroup(
+                GPS_ES_CONSUMER_GROUP,
+                CONSUMER_NAME,
+                streams={GPS_STREAM: ">"},
+                count=BATCH,
+                block=GPS_BLOCK_MS,
+            )
+        except RedisTimeoutError:
+            # An idle stream is normal, and compose sets no restart policy, so a
+            # transient read timeout must not be fatal.
+            continue
         if not resp:
             continue
         for _stream, entries in resp:
