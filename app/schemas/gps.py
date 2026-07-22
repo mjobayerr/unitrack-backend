@@ -23,3 +23,6 @@ class GpsBatch(BaseModel):
 class GpsAccepted(BaseModel):
     accepted: int
     bus_id: uuid.UUID
+    # Null means the fixes were stored trip-agnostically because the helper has
+    # no live trip. The client should treat that as "start a trip".
+    trip_id: uuid.UUID | None = None

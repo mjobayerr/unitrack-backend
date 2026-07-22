@@ -129,8 +129,8 @@ async def approve_helper(
     # -----------------------------------------------------------------------
     await invalidate_principal(r, helper.user_id)
 
-    await db.refresh(helper)
-    await db.refresh(user)
+    # No refresh() needed: the session is configured with expire_on_commit=False,
+    # so these instances keep their values after the commit.
     return _to_out(user, helper)
 
 

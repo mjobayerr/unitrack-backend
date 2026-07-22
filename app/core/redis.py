@@ -44,3 +44,19 @@ def bus_pos_key(bus_id: str) -> str:
 
 def fleet_channel() -> str:
     return "fleet:ch"
+
+
+def helper_trip_key(helper_id: str) -> str:
+    """The helper's live trip, cached so GPS ingest never queries Postgres.
+
+    Ingest runs every 5 s per bus and needs one fact: which trip do these fixes
+    belong to. Reading it from Redis keeps the hottest write path in the system
+    free of database round trips.
+    """
+    return f"helper:{helper_id}:trip"
+
+
+# A trip longer than this is abandoned, not running — a helper who force-closed
+# the app mid-route. The key expiring stops a stale trip from silently
+# collecting fixes for days; the row in Postgres stays the source of truth.
+ACTIVE_TRIP_TTL_S = 16 * 60 * 60

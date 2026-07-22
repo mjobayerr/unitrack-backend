@@ -57,7 +57,28 @@ helper POST /helper/gps ──► API ──┼──────────►
                                             Elasticsearch gps_points  ◄── GET /track/nearby
 ```
 
-### 3. Ops / scaffold
+### 3. Trip spine (P2)
+`stops`, `routes`, `route_stops`, `trips` — spec §6's requirement that every GPS
+point, redemption and seat report hangs off a trip.
+
+- Helper-initiated lifecycle: `POST /helper/trips/start` → `live`, `/end` →
+  `completed`, `/active` to recover after an app restart.
+- **One live trip per bus and per helper, enforced by partial unique indexes**
+  (`WHERE status = 'live'`), not by a check-then-insert that a double-tapped
+  Start button would race through.
+- The live trip is cached in Redis (`helper:{id}:trip`), so GPS ingest resolves
+  its `trip_id` without touching Postgres, and the trip's bus overrides whatever
+  bus the client claimed.
+- `service_date` is the **local** day (`SERVICE_TIMEZONE`, default `Asia/Dhaka`).
+  Deriving it from UTC would roll the day at 06:00 local and split a morning's
+  trips across two dates.
+- Fixes sent with no live trip are still accepted with a null `trip_id` — a
+  transition allowance until the helper app ships trip UI.
+
+`schedules` is not built; trips are ad-hoc. Recurring timetables add a
+`schedule_id` later without changing anything above.
+
+### 4. Ops / scaffold
 - Docker Compose: `postgres`, `redis`, `elasticsearch`, `api`, `worker`, `nginx` — [`docker-compose.yml`](docker-compose.yml).
 - Alembic migrations (identity core → fleet → drop gps_points) — [`alembic/versions/`](alembic/versions/).
 - Dev seed scripts: initial admin + a bus/approved-helper for GPS testing — [`scripts/`](scripts/).
@@ -148,6 +169,13 @@ curl "localhost:8000/track/nearby?lat=23.78&lng=90.40&radius_km=5"
 | GET | `/admin/helpers` | Approval queue; `?helper_status=pending` to filter. **admin** |
 | POST | `/admin/helpers/{id}/approve` | Approve a helper so they can send GPS. **admin** |
 | POST | `/admin/users/{id}/suspend` | Suspend an account; effective immediately. **admin** |
+| GET | `/fleet/buses` | Bus picker for the helper app. |
+| GET | `/fleet/routes` | Route list. |
+| GET | `/fleet/routes/{id}` | One route with its ordered stops + polyline. |
+| GET | `/fleet/stops` | All stops. |
+| POST | `/helper/trips/start` | Begin a trip (bus + route). 409 if either is already live. |
+| POST | `/helper/trips/end` | Close the caller's live trip. |
+| GET | `/helper/trips/active` | Recover state after an app restart. |
 | POST | `/helper/gps` | Ingest a batch of fixes (approved helper only). |
 | GET | `/track/nearby` | Buses within `radius_km`, closest first (ES `geo_distance`). |
 
@@ -172,8 +200,9 @@ Env vars in [`.env.example`](.env.example): Postgres, Redis, `ELASTICSEARCH_URL`
 
 ## What's next
 
-- **Trip lifecycle**: bind every GPS fix / redemption / seat report to a `trips` row (spec §6). Right now ingest is trip-agnostic.
+- **Helper app trip UI**: login + refresh, bus/route pickers, Start/Stop bound to the trip endpoints. Then GPS-without-a-trip becomes a 409.
 - **Live tracking WebSocket**: `/ws/track/{route_id}` fan-out of position + ETA + seats (spec §7.3 step 4).
+- **Admin CRUD** for stops/routes/buses — seeded by `scripts/dev_seed_routes.py` today.
 - **ETA engine**: Mapbox `driving-traffic` worker job (spec §7.4).
 - **Tickets & offline QR** (spec §7.2/§7.5), **bKash** (§9), **fraud sweep**, **reports** (§10).
 - **ES hardening**: single-node ES is not durable — add a replica + snapshot policy before production; report/fraud jobs must query ES, not Postgres joins.

@@ -47,6 +47,10 @@ def _to_doc(entry_id: str, fields: dict) -> dict:
         "_source": {
             "bus_id": fields["bus_id"],
             "helper_id": fields.get("helper_id"),
+            # Empty string means the fix predates the helper's trip lifecycle.
+            # Index it as null so `exists`/`terms` queries treat it as absent
+            # rather than matching a bogus "" trip.
+            "trip_id": fields.get("trip_id") or None,
             "ts": fields["ts"],
             "location": {"lat": float(fields["lat"]), "lon": float(fields["lng"])},
             "speed": _to_float(fields.get("speed", "")),

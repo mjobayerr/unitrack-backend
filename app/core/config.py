@@ -31,6 +31,13 @@ class Settings(BaseSettings):
     # Identity — varsity domain allow-list for student signup
     allowed_student_email_domains: str = "ulab.edu.bd"
 
+    # Operations
+    # The fleet's local timezone. Storage is UTC throughout; this is only used
+    # to decide which *service day* a trip belongs to. Deriving that from UTC
+    # would roll the day over at 06:00 local, splitting a morning's trips
+    # across two dates and quietly corrupting every ridership report.
+    service_timezone: str = "Asia/Dhaka"
+
     @property
     def database_url(self) -> str:
         return (

@@ -16,6 +16,11 @@ dependencies = [
     "argon2-cffi>=23.1",
     "redis>=5.2",
     "elasticsearch[async]>=8.15,<9",
+    # zoneinfo reads the *system* tz database, which Windows does not have and
+    # python:*-slim images do not ship. Without this, resolving
+    # settings.service_timezone raises ZoneInfoNotFoundError and every trip
+    # start fails. Explicit dependency rather than a base-image assumption.
+    "tzdata>=2024.1",
 ]
 
 [dependency-groups]

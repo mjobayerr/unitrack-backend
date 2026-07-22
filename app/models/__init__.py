@@ -1,4 +1,13 @@
-from app.models.fleet import Bus, BusStatus
+from app.models.fleet import (
+    Bus,
+    BusStatus,
+    Route,
+    RouteDirection,
+    RouteStop,
+    Stop,
+    Trip,
+    TripStatus,
+)
 from app.models.user import (
     Helper,
     HelperStatus,
@@ -17,4 +26,10 @@ __all__ = [
     "HelperStatus",
     "Bus",
     "BusStatus",
+    "Stop",
+    "Route",
+    "RouteDirection",
+    "RouteStop",
+    "Trip",
+    "TripStatus",
 ]
