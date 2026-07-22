@@ -27,6 +27,40 @@ No IoT hardware on buses. The **helper's smartphone is the only sensor** (GPS, Q
 
 ---
 
+## Status at a glance
+
+**Functional now** — built, and verified end-to-end against real Postgres +
+Redis + Elasticsearch by [`scripts/smoke_test.py`](scripts/smoke_test.py) (36 checks):
+
+| Area | State |
+|---|---|
+| Identity & JWT auth (access + refresh, argon2) | ✅ |
+| Default-deny authorization, Redis-cached `Principal`, instant revocation | ✅ |
+| Admin: helper approval queue, approve, suspend | ✅ |
+| Fleet reference data: buses, routes, stops | ✅ |
+| Trip lifecycle: start / end / active, one-live-per-bus/helper | ✅ |
+| GPS pipeline: ingest → Redis → worker → Elasticsearch → `/track/nearby` | ✅ |
+| Seat reports + latest-state cache | ✅ |
+| Alerts / SOS + admin console (list / acknowledge / resolve) | ✅ |
+
+**Not built yet** — in the spec, not started (roadmap order):
+
+| Area | Notes |
+|---|---|
+| Tickets, wallet, bKash purchase | Blocked on bKash credentials. Payment is the gate; the QR/ride model is designed (spec §7.2/§7.5) |
+| Offline QR validation + fraud sweep | Depends on tickets |
+| Live-tracking WebSocket `/ws/track/{route_id}` | nginx already carries the upgrade headers |
+| ETA engine | Free path (route-offset + rolling speed) if no Mapbox key |
+| Materialized report tables + admin dashboards | Spec §10 |
+| Email/SMTP (verification is logged to stdout for now) | Later phase |
+
+Sibling clients: **[unitrack-helper](https://github.com/mjobayerr/unitrack-helper)**
+(Flutter, functional) · **[unitrack-web](https://github.com/mjobayerr/unitrack-web)**
+(Next.js, not started — so **admin approval currently has no UI**; approve via
+`/docs`, `POST /admin/helpers/{id}/approve`, or the dev seed script).
+
+---
+
 ## What's done
 
 ### 1. Identity core (P1)
@@ -177,9 +211,15 @@ curl "localhost:8000/track/nearby?lat=23.78&lng=90.40&radius_km=5"
 | POST | `/helper/trips/end` | Close the caller's live trip. |
 | GET | `/helper/trips/active` | Recover state after an app restart. |
 | POST | `/helper/gps` | Ingest a batch of fixes (approved helper only). |
+| POST | `/helper/seats` | Report occupancy for the live trip. |
+| POST | `/helper/alerts` | Raise an alert (SOS / breakdown / …); severity set server-side. |
+| GET | `/admin/alerts` | Open alerts, worst first. **admin** |
+| POST | `/admin/alerts/{id}/acknowledge` | Claim an alert. **admin** |
+| POST | `/admin/alerts/{id}/resolve` | Close an alert with a note. **admin** |
 | GET | `/track/nearby` | Buses within `radius_km`, closest first (ES `geo_distance`). |
 
-Full contract: `GET /openapi.json` (clients generate types from it).
+Full contract: `GET /openapi.json` (clients generate types from it). All 20
+endpoints are exercised end-to-end by [`scripts/smoke_test.py`](scripts/smoke_test.py).
 
 ### Auth
 
@@ -196,7 +236,69 @@ example: [`app/api/routes/admin.py`](app/api/routes/admin.py).
 
 ## Config
 
-Env vars in [`.env.example`](.env.example): Postgres, Redis, `ELASTICSEARCH_URL`, `GPS_INDEX`, `JWT_SECRET`, token TTLs, `ALLOWED_STUDENT_EMAIL_DOMAINS`. Real `.env` is gitignored — never commit secrets.
+Env vars: copy [`.env.example`](.env.example) to `.env` for local dev.
+Postgres, Redis (`REDIS_PASSWORD` empty in dev), `ELASTICSEARCH_URL`, `GPS_INDEX`,
+`JWT_SECRET`, token TTLs, `ALLOWED_STUDENT_EMAIL_DOMAINS`, `SERVICE_TIMEZONE`.
+Real `.env` is gitignored — never commit secrets.
+
+---
+
+## Deploying to a VPS (behind Cloudflare)
+
+The dev `docker-compose.yml` publishes Postgres/Redis/Elasticsearch on host
+ports so the local `uv` workflow can reach them. **On a public VPS those ports
+would expose the databases to the internet**, so production uses a separate
+[`docker-compose.prod.yml`](docker-compose.prod.yml) that publishes only nginx.
+
+Topology:
+
+```
+Flutter app ──HTTPS──► Cloudflare ──HTTPS──► VPS :443 nginx ──► api:8000
+             api.kodewithmj.xyz   (Full Strict)   (internal Docker network:
+                                                    postgres · redis · es · worker)
+```
+
+Steps on a fresh 4 GB+ VPS (Ubuntu):
+
+```bash
+# 1. Elasticsearch needs this or it crash-loops on boot
+sudo sysctl -w vm.max_map_count=262144      # persist in /etc/sysctl.conf
+
+# 2. firewall: only SSH + HTTPS reach the box
+sudo ufw allow 22 && sudo ufw allow 443 && sudo ufw enable
+
+# 3. secrets
+cp .env.prod.example .env.prod              # then fill every CHANGE_ME
+python -c "import secrets; print(secrets.token_urlsafe(48))"   # -> JWT_SECRET
+openssl rand -base64 24                      # -> POSTGRES_PASSWORD, REDIS_PASSWORD
+
+# 4. TLS: Cloudflare Origin Certificate (free, 15-year), saved as
+#    deploy/certs/origin.pem and deploy/certs/origin.key
+
+# 5. DNS: A record  api.kodewithmj.xyz -> VPS IP, proxied (orange cloud)
+#    Cloudflare SSL/TLS mode: Full (Strict).  NOT Flexible.
+
+# 6. up
+docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+docker compose -f docker-compose.prod.yml --env-file .env.prod run --rm api alembic upgrade head
+```
+
+Then point the app's release build at it:
+`flutter build apk --release --dart-define=UNITRACK_BASE_URL=https://api.kodewithmj.xyz`
+
+**Security checklist** (details in the deploy files' comments):
+
+| Do | Why |
+|---|---|
+| Never publish DB ports on the VPS | An open Redis/Postgres on the internet is compromised in minutes — the prod compose already omits them |
+| Real `JWT_SECRET` | Default lets anyone forge an admin token |
+| Strong Postgres + Redis passwords | Default `unitrack` / no-auth is trivially breached |
+| Cloudflare **Full (Strict)**, never Flexible | Flexible leaves Cloudflare→origin in cleartext |
+| `ufw` to 22 + 443 only | Defense in depth behind the port choices |
+
+Not yet hardened (documented, follow-up): Elasticsearch auth (kept internal-only
+for now), ES replica + snapshot policy, rate limiting on `/auth/login`, and
+refresh-token rotation/revocation (see [`docs/auth.md`](docs/auth.md) "Known gaps").
 
 ## What's next
 

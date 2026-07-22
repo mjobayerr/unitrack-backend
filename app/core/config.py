@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     # Redis
     redis_host: str = "redis"
     redis_port: int = 6379
+    # Empty in dev (Redis runs without auth); set in production where Redis
+    # runs with requirepass. Empty means "no password", i.e. current behaviour.
+    redis_password: str = ""
 
     # Elasticsearch
     elasticsearch_url: str = "http://elasticsearch:9200"

@@ -20,6 +20,10 @@ def get_redis_client() -> Redis:
         _client = Redis(
             host=settings.redis_host,
             port=settings.redis_port,
+            # None when unset, which is exactly the dev default (no auth). In
+            # production Redis runs with requirepass and this carries it, so the
+            # addition is invisible to the local setup.
+            password=settings.redis_password or None,
             decode_responses=True,
             socket_timeout=SOCKET_TIMEOUT_S,
         )

@@ -9,10 +9,14 @@ env/
 .mypy_cache/
 .ruff_cache/
 
-# Env / secrets
+# Env / secrets — real .env files are ignored; the *.example samples are kept.
 .env
 .env.*
 !.env.example
+!.env.prod.example
+
+# TLS material for the prod stack (mounted into nginx). Never commit keys.
+deploy/certs/
 
 # Data / runtime
 *.sqlite3

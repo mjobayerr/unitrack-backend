@@ -1,0 +1,105 @@
+# Production stack — standalone, NOT an override of docker-compose.yml.
+#
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+#
+# It exists as a separate file on purpose: the dev docker-compose.yml publishes
+# Postgres/Redis/Elasticsearch on host ports because the local `uv` workflow
+# connects to them from the Windows host. On a public VPS those same published
+# ports would expose the databases to the internet. This file publishes NOTHING
+# except nginx, so the databases are reachable only on the internal Docker
+# network.
+#
+# What still needs doing on the host before `up`:
+#   - vm.max_map_count=262144         (Elasticsearch refuses to boot otherwise)
+#   - a firewall (ufw) allowing only 22 and 443
+#   - .env.prod filled from .env.prod.example with REAL secrets
+#   - TLS cert + key at deploy/certs/  (Cloudflare Origin Certificate is easiest)
+# See README "Deploying to a VPS".
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env.prod}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set a strong password in .env.prod}
+      POSTGRES_DB: ${POSTGRES_DB:?set in .env.prod}
+    # No `ports:` — internal network only. nginx and the api reach it by name.
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7
+    # requirepass turns on auth. The api reads the same value from REDIS_PASSWORD
+    # and sends it; there is no open-Redis window.
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set a strong password in .env.prod}"]
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    environment:
+      discovery.type: single-node
+      # Kept off because the api's ES client does not send credentials yet, and
+      # ES is not reachable off the internal network. Turning this on is a
+      # follow-up hardening step (add auth to app/core/elasticsearch.py first).
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: ${ES_JAVA_OPTS:--Xms512m -Xmx512m}
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  api:
+    build: .
+    env_file: .env.prod
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      elasticsearch: {condition: service_healthy}
+    restart: unless-stopped
+    # No host port: nginx is the only way in.
+
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    env_file: .env.prod
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      elasticsearch: {condition: service_healthy}
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.27
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx.prod.conf:/etc/nginx/conf.d/default.conf:ro
+      # Put the TLS cert + key here. With Cloudflare in front, a Cloudflare
+      # Origin Certificate (15-year, free) is the least fuss.
+      - ./deploy/certs:/etc/nginx/certs:ro
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+  es-data:
