@@ -15,6 +15,7 @@ called itself out: "the real path is an admin approval endpoint".
 """
 
 import uuid
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from redis.asyncio import Redis
@@ -25,8 +26,10 @@ from app.api.deps import require_admin
 from app.core.authz import Principal, invalidate_principal
 from app.core.redis import get_redis
 from app.db.session import get_db
+from app.models.ops import Alert, AlertStatus
 from app.models.user import Helper, HelperStatus, User, UserStatus
 from app.schemas.admin import HelperOut
+from app.schemas.ops import AlertOut, AlertResolveIn
 
 # ---------------------------------------------------------------------------
 # RULE 1 — the guard lives on the router.
@@ -164,3 +167,70 @@ async def suspend_user(
     await db.commit()
 
     await invalidate_principal(r, user_id)
+
+
+# ---------------------------------------------------------------------------
+# Emergency console (spec §7.6)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/alerts", response_model=list[AlertOut])
+async def list_alerts(
+    db: AsyncSession = Depends(get_db),
+    alert_status: AlertStatus | None = Query(
+        default=AlertStatus.open, description="Defaults to open; pass null for all."
+    ),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[Alert]:
+    """The emergency console's list — worst first, newest first within severity.
+
+    Backed by `ix_alerts_status_severity`, so the default view stays an index
+    scan over open rows rather than a sort of the whole table as history grows.
+    """
+    stmt = select(Alert)
+    if alert_status is not None:
+        stmt = stmt.where(Alert.status == alert_status)
+    stmt = stmt.order_by(Alert.severity, Alert.created_at.desc()).limit(limit)
+    return list((await db.execute(stmt)).scalars())
+
+
+@router.post("/alerts/{alert_id}/acknowledge", response_model=AlertOut)
+async def acknowledge_alert(
+    alert_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    admin: Principal = Depends(require_admin),
+) -> Alert:
+    """Claim an alert so two admins do not work the same incident."""
+    alert = await db.get(Alert, alert_id)
+    if alert is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown alert")
+    if alert.status is not AlertStatus.open:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Alert is already {alert.status}")
+
+    alert.status = AlertStatus.acknowledged
+    alert.acknowledged_by = admin.user_id
+    await db.commit()
+    return alert
+
+
+@router.post("/alerts/{alert_id}/resolve", response_model=AlertOut)
+async def resolve_alert(
+    alert_id: uuid.UUID,
+    body: AlertResolveIn,
+    db: AsyncSession = Depends(get_db),
+    admin: Principal = Depends(require_admin),
+) -> Alert:
+    """Close an incident. A resolved alert keeps who acknowledged it and why."""
+    alert = await db.get(Alert, alert_id)
+    if alert is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown alert")
+    if alert.status in (AlertStatus.resolved, AlertStatus.dismissed):
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Alert is already {alert.status}")
+
+    alert.status = AlertStatus.resolved
+    alert.resolved_note = body.note
+    alert.resolved_at = datetime.now(UTC)
+    if alert.acknowledged_by is None:
+        alert.acknowledged_by = admin.user_id
+    await db.commit()
+    return alert

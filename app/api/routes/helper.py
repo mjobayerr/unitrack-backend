@@ -16,8 +16,11 @@ from app.core.authz import Principal
 from app.core.redis import GPS_STREAM, bus_pos_key, fleet_channel, get_redis
 from app.db.session import get_db
 from app.models.fleet import Bus
+from app.models.ops import AlertSource
 from app.schemas.gps import GpsAccepted, GpsBatch
+from app.schemas.ops import AlertOut, AlertRaiseIn, SeatReportIn, SeatStateOut
 from app.schemas.trip import ActiveTripOut, TripOut, TripStartRequest
+from app.services import ops as ops_service
 from app.services import trip as trip_service
 
 router = APIRouter(
@@ -79,6 +82,82 @@ async def get_active_trip(
     """What the app calls on launch to recover state after a restart or crash."""
     active = await trip_service.get_active_trip(db, r, helper.helper_id)
     return None if active is None else ActiveTripOut(**vars(active))
+
+
+# --------------------------------------------------------------------------
+# Seat counts and alerts
+# --------------------------------------------------------------------------
+
+
+@router.post("/seats", response_model=SeatStateOut, status_code=status.HTTP_201_CREATED)
+async def report_seats(
+    body: SeatReportIn,
+    helper: Principal = Depends(require_approved_helper),
+    db: AsyncSession = Depends(get_db),
+    r: Redis = Depends(get_redis),
+) -> SeatStateOut:
+    """Report how full the bus is (spec §6 `seat_reports`).
+
+    Requires a live trip: an occupancy count with no trip cannot be attributed
+    to a route or a time window, which is the only thing that makes it useful.
+    """
+    active = await trip_service.get_active_trip(db, r, helper.helper_id)
+    if active is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Start a trip before reporting seats")
+
+    bus = await db.get(Bus, active.bus_id)
+    if bus is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown bus")
+
+    report = await ops_service.report_seats(
+        db,
+        r,
+        trip_id=active.trip_id,
+        helper_id=helper.helper_id,
+        bus=bus,
+        occupied=body.occupied,
+        reported_at=body.reported_at,
+    )
+    return SeatStateOut(
+        trip_id=active.trip_id,
+        occupied=report.occupied,
+        capacity=report.capacity_snapshot,
+        # Clamped at zero: an over-capacity bus has no negative free seats, and
+        # the student app would render "-3 seats available".
+        free=max(report.capacity_snapshot - report.occupied, 0),
+        reported_at=report.reported_at,
+    )
+
+
+@router.post("/alerts", response_model=AlertOut, status_code=status.HTTP_201_CREATED)
+async def raise_alert(
+    body: AlertRaiseIn,
+    helper: Principal = Depends(require_approved_helper),
+    db: AsyncSession = Depends(get_db),
+    r: Redis = Depends(get_redis),
+) -> AlertOut:
+    """Raise an alert from the emergency screen (spec §7.6).
+
+    Works without a live trip on purpose — a breakdown on the way to the depot
+    is still a breakdown, and an SOS must never be refused on a technicality.
+
+    Severity is assigned by the server from the type; the client does not get a
+    say, or every alert would arrive critical.
+    """
+    active = await trip_service.get_active_trip(db, r, helper.helper_id)
+    alert = await ops_service.raise_alert(
+        db,
+        r,
+        source=AlertSource.helper,
+        alert_type=body.type,
+        raised_by=helper.user_id,
+        trip_id=active.trip_id if active else None,
+        bus_id=active.bus_id if active else None,
+        message=body.message,
+        lat=body.lat,
+        lng=body.lng,
+    )
+    return AlertOut.model_validate(alert)
 
 
 # --------------------------------------------------------------------------

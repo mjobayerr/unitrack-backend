@@ -46,6 +46,24 @@ def fleet_channel() -> str:
     return "fleet:ch"
 
 
+def bus_seats_key(bus_id: str) -> str:
+    """Latest occupancy for the live map (spec §6 keyspace). TTL 900 s.
+
+    Redis is "now": a seat count older than fifteen minutes is not current
+    availability, so it expires rather than misleading a waiting student.
+    Postgres keeps the full history.
+    """
+    return f"bus:{bus_id}:seats"
+
+
+SEATS_TTL_S = 900
+
+
+def alerts_channel() -> str:
+    """New/updated alerts fan out to the admin console."""
+    return "alerts:ch"
+
+
 def helper_trip_key(helper_id: str) -> str:
     """The helper's live trip, cached so GPS ingest never queries Postgres.
 

@@ -8,6 +8,14 @@ from app.models.fleet import (
     Trip,
     TripStatus,
 )
+from app.models.ops import (
+    Alert,
+    AlertSeverity,
+    AlertSource,
+    AlertStatus,
+    AlertType,
+    SeatReport,
+)
 from app.models.user import (
     Helper,
     HelperStatus,
@@ -32,4 +40,10 @@ __all__ = [
     "RouteStop",
     "Trip",
     "TripStatus",
+    "SeatReport",
+    "Alert",
+    "AlertSource",
+    "AlertType",
+    "AlertSeverity",
+    "AlertStatus",
 ]
