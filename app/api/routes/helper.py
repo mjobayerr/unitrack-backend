@@ -81,7 +81,15 @@ async def get_active_trip(
 ) -> ActiveTripOut | None:
     """What the app calls on launch to recover state after a restart or crash."""
     active = await trip_service.get_active_trip(db, r, helper.helper_id)
-    return None if active is None else ActiveTripOut(**vars(active))
+    if active is None:
+        return None
+    # Fields listed explicitly: ActiveTrip is a slots dataclass, so it has no
+    # __dict__ and vars() raises TypeError on it.
+    return ActiveTripOut(
+        trip_id=active.trip_id,
+        bus_id=active.bus_id,
+        route_id=active.route_id,
+    )
 
 
 # --------------------------------------------------------------------------
