@@ -1,0 +1,17 @@
+# Normalize everything to LF in the repo; check out native on Windows.
+# The Docker images are Linux — a CRLF shell script or entrypoint fails there
+# with a confusing "not found", so this is correctness, not tidiness.
+* text=auto eol=lf
+
+# Scripts whose line endings are load-bearing.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Never touch these.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+uv.lock -diff
