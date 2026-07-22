@@ -145,10 +145,26 @@ curl "localhost:8000/track/nearby?lat=23.78&lng=90.40&radius_km=5"
 | POST | `/auth/login` | Access + refresh tokens; blocks non-active accounts. |
 | POST | `/auth/refresh` | New token pair from a refresh token. |
 | GET | `/auth/me` | Current user (Bearer access token). |
+| GET | `/admin/helpers` | Approval queue; `?helper_status=pending` to filter. **admin** |
+| POST | `/admin/helpers/{id}/approve` | Approve a helper so they can send GPS. **admin** |
+| POST | `/admin/users/{id}/suspend` | Suspend an account; effective immediately. **admin** |
 | POST | `/helper/gps` | Ingest a batch of fixes (approved helper only). |
 | GET | `/track/nearby` | Buses within `radius_km`, closest first (ES `geo_distance`). |
 
 Full contract: `GET /openapi.json` (clients generate types from it).
+
+### Auth
+
+Every route is authenticated and authorized except the handful in
+`PUBLIC_PATHS` (register / verify / login / refresh / health / docs) — enforced
+by [`tests/test_auth_coverage.py`](tests/test_auth_coverage.py), which fails the
+build on any unguarded route. Guards live on the router; the caller's role and
+status are resolved into a Redis-cached `Principal` (~0.15 ms, no Postgres hit
+on the hot path) and invalidated on every write to `users` / `helpers`, so
+suspension takes effect on the next request.
+
+**Read [`docs/auth.md`](docs/auth.md) before adding an endpoint.** Worked
+example: [`app/api/routes/admin.py`](app/api/routes/admin.py).
 
 ## Config
 

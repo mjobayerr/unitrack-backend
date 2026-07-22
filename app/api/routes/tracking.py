@@ -7,9 +7,17 @@ still owns single-bus "latest position"; ES owns "which buses are near me".
 from elasticsearch import AsyncElasticsearch
 from fastapi import APIRouter, Depends, Query
 
+from app.api.deps import require_authenticated
 from app.core.elasticsearch import GPS_INDEX, get_es
 
-router = APIRouter(prefix="/track", tags=["tracking"])
+# Any signed-in, active account may look up buses — students, helpers, admins
+# all need it. Not public: live vehicle positions are the fleet's whereabouts,
+# and an unauthenticated endpoint hands them to anyone who finds the URL.
+router = APIRouter(
+    prefix="/track",
+    tags=["tracking"],
+    dependencies=[Depends(require_authenticated)],
+)
 
 
 @router.get("/nearby")

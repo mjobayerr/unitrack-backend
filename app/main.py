@@ -2,7 +2,7 @@ import logging
 
 from fastapi import FastAPI
 
-from app.api.routes import auth, helper, tracking
+from app.api.routes import api_router
 from app.core.config import settings
 
 logging.basicConfig(level=logging.INFO)
@@ -19,9 +19,9 @@ def create_app() -> FastAPI:
     async def health() -> dict[str, str]:
         return {"status": "ok", "env": settings.env}
 
-    app.include_router(auth.router)
-    app.include_router(helper.router)
-    app.include_router(tracking.router)
+    # One line, forever. New routers register in app/api/routes/__init__.py,
+    # where the auth-coverage test can also see them.
+    app.include_router(api_router)
     return app
 
 

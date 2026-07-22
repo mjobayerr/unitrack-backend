@@ -4,20 +4,27 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_helper
+from app.api.deps import require_approved_helper
+from app.core.authz import Principal
 from app.core.redis import GPS_STREAM, bus_pos_key, fleet_channel, get_redis
 from app.db.session import get_db
 from app.models.fleet import Bus
-from app.models.user import Helper
 from app.schemas.gps import GpsAccepted, GpsBatch
 
-router = APIRouter(prefix="/helper", tags=["helper"])
+# Guarded at the router: helper role AND helpers.status = 'approved'. A helper
+# self-registers as pending, so without the approval check anyone who completed
+# signup could inject GPS fixes for any bus.
+router = APIRouter(
+    prefix="/helper",
+    tags=["helper"],
+    dependencies=[Depends(require_approved_helper)],
+)
 
 
 @router.post("/gps", response_model=GpsAccepted, status_code=status.HTTP_202_ACCEPTED)
 async def ingest_gps(
     batch: GpsBatch,
-    helper: Helper = Depends(get_current_helper),
+    helper: Principal = Depends(require_approved_helper),
     db: AsyncSession = Depends(get_db),
     r: Redis = Depends(get_redis),
 ) -> GpsAccepted:
@@ -52,7 +59,7 @@ async def ingest_gps(
             GPS_STREAM,
             {
                 "bus_id": bus_id,
-                "helper_id": str(helper.id),
+                "helper_id": str(helper.helper_id),
                 "ts": p.ts.astimezone(UTC).isoformat(),
                 "lat": str(p.lat),
                 "lng": str(p.lng),
