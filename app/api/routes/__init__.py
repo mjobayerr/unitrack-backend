@@ -15,7 +15,7 @@ is a build failure rather than a code-review hope.
 
 from fastapi import APIRouter
 
-from app.api.routes import admin, auth, fleet, helper, tracking
+from app.api.routes import admin, auth, bus_track, fleet, helper, tracking
 
 # Every router in the API. `api_router` is built from this tuple rather than
 # from a list of include_router() calls, so the auth-coverage test and the
@@ -23,6 +23,7 @@ from app.api.routes import admin, auth, fleet, helper, tracking
 ROUTERS: tuple[APIRouter, ...] = (
     auth.router,
     admin.router,
+    bus_track.router,
     fleet.router,
     helper.router,
     tracking.router,
@@ -42,6 +43,7 @@ PUBLIC_PATHS: frozenset[str] = frozenset(
         "/auth/verify-email",  # the token in the emailed link IS the credential
         "/auth/login",  # issues the credential
         "/auth/refresh",  # the refresh token IS the credential
+        "/bus-track",  # public read-only bus location lookup for clients
         # FastAPI's own docs endpoints.
         "/docs",
         "/docs/oauth2-redirect",

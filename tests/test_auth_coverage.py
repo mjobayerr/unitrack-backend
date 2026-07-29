@@ -9,8 +9,21 @@ Needs no database, no Redis, no network — it inspects the dependency graph
 FastAPI builds at import time, so it runs in milliseconds and can gate CI.
 """
 
-from fastapi.dependencies.models import Dependant
-from fastapi.routing import APIRoute
+from typing import TYPE_CHECKING
+
+try:
+    from fastapi.dependencies.models import Dependant
+    from fastapi.routing import APIRoute
+except Exception:  # pragma: no cover - fallback for editor/language-server
+    if TYPE_CHECKING:  # type-checkers still see the real types
+        from fastapi.dependencies.models import Dependant  # type: ignore
+        from fastapi.routing import APIRoute  # type: ignore
+    else:
+        class Dependant:  # minimal runtime placeholder when FastAPI isn't importable
+            pass
+
+        class APIRoute:  # minimal runtime placeholder
+            pass
 
 from app.api.deps import get_principal
 from app.api.routes import PUBLIC_PATHS, ROUTERS
