@@ -30,3 +30,4 @@ def test_bus_track_returns_current_location_from_redis() -> None:
         "lng": "90.4123",
         "ts": "2025-01-01T00:00:00Z",
     }
+    assert response.json()["bus_id"] == "bus-123"
