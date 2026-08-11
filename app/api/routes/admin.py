@@ -14,6 +14,7 @@ Replaces the `scripts/dev_seed_fleet.py` approval shortcut, whose own docstring
 called itself out: "the real path is an admin approval endpoint".
 """
 
+import logging
 import uuid
 from datetime import UTC, datetime
 
@@ -24,14 +25,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_admin
 from app.core.authz import Principal, invalidate_principal
-from app.core.redis import get_redis
+from app.core.redis import (
+    bus_pos_key,
+    bus_seats_key,
+    get_redis,
+    trip_eta_key,
+)
 from app.db.session import get_db
-from app.models.fleet import Bus
+from app.models.fleet import Bus, Route, Trip, TripStatus
 from app.models.ops import Alert, AlertStatus
 from app.models.user import Helper, HelperStatus, User, UserStatus
-from app.schemas.admin import HelperOut
+from app.schemas.admin import FleetBusOut, FleetOut, GpsFreshness, HelperOut
 from app.schemas.fleet import BusCreate, BusListCreate, BusOut
 from app.schemas.ops import AlertOut, AlertResolveIn
+from app.services.fleet_view import (
+    age_seconds,
+    classify,
+    next_stop_minutes,
+    parse_position,
+    parse_seats,
+)
+
+logger = logging.getLogger("unitrack.api.admin")
 
 # ---------------------------------------------------------------------------
 # RULE 1 — the guard lives on the router.
@@ -169,6 +184,113 @@ async def suspend_user(
     await db.commit()
 
     await invalidate_principal(r, user_id)
+
+
+# ---------------------------------------------------------------------------
+# Live fleet map (spec §10.2)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/fleet", response_model=FleetOut)
+async def live_fleet(
+    db: AsyncSession = Depends(get_db),
+    r: Redis = Depends(get_redis),
+) -> FleetOut:
+    """Every live trip with its latest known position.
+
+    Deliberately **not** built on `/track/nearby`. That endpoint answers "what
+    is close to this point", which needs an origin and a radius the console does
+    not have — an admin wants the whole fleet, including the bus parked at the
+    depot forty kilometres away.
+
+    One Postgres query for the live trips, then a single Redis pipeline for all
+    of their positions, seats and cached ETAs. Cost is a handful of round trips
+    regardless of fleet size, which is what makes a five-second console refresh
+    reasonable.
+
+    A bus with no position is still returned, flagged `lost`. Dropping it would
+    make a helper whose phone died look like a trip that was never running —
+    precisely the situation the console exists to surface.
+    """
+    now = datetime.now(UTC)
+
+    rows = (
+        await db.execute(
+            select(Trip, Bus, Route, Helper, User)
+            .join(Bus, Bus.id == Trip.bus_id)
+            .join(Route, Route.id == Trip.route_id)
+            .join(Helper, Helper.id == Trip.helper_id)
+            .join(User, User.id == Helper.user_id)
+            .where(Trip.status == TripStatus.live)
+            .order_by(Trip.actual_start)
+        )
+    ).all()
+
+    if not rows:
+        return FleetOut(generated_at=now, total=0, live=0, stale=0, lost=0, buses=[])
+
+    # One pipeline for the whole fleet: 3 reads per bus issued together rather
+    # than 3 sequential waits each.
+    pipe = r.pipeline(transaction=False)
+    for trip, bus, *_ in rows:
+        pipe.hgetall(bus_pos_key(str(bus.id)))
+        pipe.hgetall(bus_seats_key(str(bus.id)))
+        pipe.get(trip_eta_key(str(trip.id)))
+    try:
+        cached = await pipe.execute()
+    except Exception:  # noqa: BLE001
+        # Redis is down. The trips are real and worth showing; every bus simply
+        # reads as `lost`, which is a truthful description of what we know.
+        logger.warning("fleet map could not read Redis; reporting positions as lost")
+        cached = [None] * (len(rows) * 3)
+
+    buses: list[FleetBusOut] = []
+    tally = {GpsFreshness.live: 0, GpsFreshness.stale: 0, GpsFreshness.lost: 0}
+
+    for index, (trip, bus, route, helper, user) in enumerate(rows):
+        raw_pos, raw_seats, raw_eta = cached[index * 3 : index * 3 + 3]
+
+        position = parse_position(raw_pos)
+        age = age_seconds(position.ts if position else None, now)
+        freshness = classify(age)
+        tally[freshness] += 1
+        occupied, capacity = parse_seats(raw_seats)
+
+        buses.append(
+            FleetBusOut(
+                trip_id=trip.id,
+                bus_id=bus.id,
+                reg_no=bus.reg_no,
+                nickname=bus.nickname,
+                route_id=route.id,
+                route_name=route.name,
+                route_direction=route.direction,
+                helper_id=helper.id,
+                helper_name=user.name,
+                started_at=trip.actual_start,
+                lat=position.lat if position else None,
+                lng=position.lng if position else None,
+                heading=position.heading if position else None,
+                speed_kmh=position.speed_kmh if position else None,
+                fix_ts=position.ts if position else None,
+                fix_age_s=age,
+                freshness=freshness,
+                occupied=occupied,
+                # Fall back to the bus's configured capacity so the console can
+                # still show "— / 45" before the helper reports a count.
+                capacity=capacity if capacity is not None else bus.capacity,
+                next_stop_eta_minutes=next_stop_minutes(raw_eta, now),
+            )
+        )
+
+    return FleetOut(
+        generated_at=now,
+        total=len(buses),
+        live=tally[GpsFreshness.live],
+        stale=tally[GpsFreshness.stale],
+        lost=tally[GpsFreshness.lost],
+        buses=buses,
+    )
 
 
 # ---------------------------------------------------------------------------
