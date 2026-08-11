@@ -13,7 +13,7 @@ point of the split:
 
 import json
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from elasticsearch import AsyncElasticsearch
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -38,6 +38,62 @@ router = APIRouter(
 )
 
 
+# How recent a fix has to be to count as "where a bus is now".
+#
+# The helper app posts a batch every 5 s, so two minutes is roughly twenty-four
+# missed batches — comfortably past a tunnel or a dropped connection, while
+# still short enough that a bus which has genuinely stopped reporting disappears
+# from the map instead of lingering.
+NEARBY_FRESH_S = 120
+
+
+def build_nearby_query(
+    origin: dict[str, float], radius_km: float, cutoff: datetime
+) -> dict:
+    """The Elasticsearch body for "which buses are near me, right now".
+
+    Extracted so the two things that were once wrong here can be asserted
+    without a running Elasticsearch — see tests/test_nearby_query.py.
+
+    Both parts matter, and the original had neither:
+
+    **The freshness filter.** Without a `range` on `ts` this searches the entire
+    fix history, so a bus that stopped reporting days ago still answers. The
+    endpoint's docstring always claimed "a recent fix"; nothing enforced it.
+
+    **Sorting by `ts` before distance.** `collapse` keeps one document per bus,
+    and *the first sort key decides which one*. Sorting by `_geo_distance` first
+    therefore picked the closest point that bus had ever recorded — so a bus
+    currently 4 km away, which happened to drive past this spot an hour earlier,
+    was reported at that old position, 50 m away. Worse than stale: it sends a
+    student to a stop for a bus that is not coming. Sorting by `ts` descending
+    picks the latest fix, and the distance sort stays as a tiebreak and to make
+    Elasticsearch compute the distance for us.
+    """
+    return {
+        "query": {
+            "bool": {
+                # `filter`, not `must`: neither clause needs to contribute a
+                # relevance score, and filters are cacheable.
+                "filter": [
+                    {
+                        "geo_distance": {
+                            "distance": f"{radius_km}km",
+                            "location": origin,
+                        }
+                    },
+                    {"range": {"ts": {"gte": cutoff.isoformat()}}},
+                ]
+            }
+        },
+        "collapse": {"field": "bus_id"},
+        "sort": [
+            {"ts": {"order": "desc"}},
+            {"_geo_distance": {"location": origin, "order": "asc", "unit": "km"}},
+        ],
+    }
+
+
 @router.get("/nearby")
 async def nearby_buses(
     lat: float = Query(ge=-90, le=90),
@@ -46,18 +102,16 @@ async def nearby_buses(
     limit: int = Query(default=20, ge=1, le=100),
     es: AsyncElasticsearch = Depends(get_es),
 ) -> dict:
-    """Buses with a recent fix within `radius_km`, closest first.
-
-    `collapse` on bus_id returns one hit per bus; the `_geo_distance` sort makes
-    that hit the closest point and exposes its distance.
+    """Buses whose latest fix is within `radius_km` and newer than
+    `NEARBY_FRESH_S`, closest first.
     """
     origin = {"lat": lat, "lon": lng}
+    cutoff = datetime.now(UTC) - timedelta(seconds=NEARBY_FRESH_S)
+
     res = await es.search(
         index=GPS_INDEX,
         size=limit,
-        query={"geo_distance": {"distance": f"{radius_km}km", "location": origin}},
-        collapse={"field": "bus_id"},
-        sort=[{"_geo_distance": {"location": origin, "order": "asc", "unit": "km"}}],
+        **build_nearby_query(origin, radius_km, cutoff),
     )
     buses = [
         {
@@ -65,10 +119,16 @@ async def nearby_buses(
             "location": h["_source"]["location"],
             "ts": h["_source"]["ts"],
             "speed": h["_source"].get("speed"),
-            "distance_km": round(h["sort"][0], 3),
+            # Index 1: `sort` is [ts, distance], so the distance Elasticsearch
+            # computed is the second value.
+            "distance_km": round(h["sort"][1], 3),
         }
         for h in res["hits"]["hits"]
     ]
+    # Elasticsearch ordered these newest-first because that is what `collapse`
+    # needed. The endpoint promises closest-first, so reorder here — at most
+    # `limit` (100) rows, so the cost is nothing.
+    buses.sort(key=lambda b: b["distance_km"])
     return {"origin": origin, "radius_km": radius_km, "count": len(buses), "buses": buses}
 
 
