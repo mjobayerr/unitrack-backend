@@ -29,8 +29,9 @@ No IoT hardware on buses. The **helper's smartphone is the only sensor** (GPS, Q
 
 ## Status at a glance
 
-**Functional now** — built, and verified end-to-end against real Postgres +
-Redis + Elasticsearch by [`scripts/smoke_test.py`](scripts/smoke_test.py) (36 checks):
+**Functional now** — 161 unit tests, plus 37 end-to-end checks against real
+Postgres + Redis + Elasticsearch ([`scripts/smoke_test.py`](scripts/smoke_test.py)).
+Both run in CI on every push ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
 
 | Area | State |
 |---|---|
@@ -47,17 +48,17 @@ Redis + Elasticsearch by [`scripts/smoke_test.py`](scripts/smoke_test.py) (36 ch
 | Payment reconciler — settles orders no report ever arrived for (spec §9) | ✅ |
 | Boarding QR: Ed25519 rotating codes, manifest, redemption sync (spec §7.2/§7.5) | ✅ |
 | Cross-device fraud sweep — suspends reused codes, raises an alert | ✅ |
+| **ETA engine** — rolling observed speed near stops, schedule further out (spec §7.4) | ✅ |
+| **Admin catalog CRUD** — products, stops, routes (no psql needed) | ✅ |
+| **Email/SMTP** — student verification actually sends | ✅ |
 
 **Not built yet** — in the spec, not started (roadmap order):
 
 | Area | Notes |
 |---|---|
-| Live-tracking WebSocket `/ws/track/{route_id}` | nginx already carries the upgrade headers |
-| ETA engine | Free path (route-offset + rolling speed) if no Mapbox key |
+| Live-tracking WebSocket `/ws/track/{route_id}` | nginx already carries the upgrade headers; clients poll for now |
 | Materialized report tables + admin dashboards | Spec §10 |
-| Admin CRUD for stops and routes | Buses have endpoints; stops/routes are seed-script only |
 | `audit_logs` | Spec §6. Admin actions record `approved_by` / `acknowledged_by` on the row itself; there is no separate trail |
-| Email/SMTP (verification is logged to stdout for now) | Later phase |
 
 Sibling clients: **[unitrack-helper](https://github.com/mjobayerr/unitrack-helper)**
 (Flutter — GPS tracking and the offline boarding scanner; APKs build in CI) ·
@@ -347,12 +348,11 @@ Still open: an ES replica + snapshot policy — single-node ES is not durable.
 
 ## What's next
 
-- **Admin CRUD** for stops/routes — buses have endpoints, the rest is `scripts/dev_seed_routes.py`.
+- **Live tracking WebSocket**: `/ws/track/{route_id}` fan-out of position + ETA + seats (spec §7.3 step 4). Clients poll today, which works but costs a request per tick.
 - **`audit_logs`** (spec §6): who did what, as a trail rather than a column on the affected row.
-- **Live tracking WebSocket**: `/ws/track/{route_id}` fan-out of position + ETA + seats (spec §7.3 step 4).
-- **ETA engine**: Mapbox `driving-traffic` worker job (spec §7.4), or the free route-offset path.
 - **Reports** (§10) — `orders` and `tickets` now exist to aggregate.
-- **ES hardening**: single-node ES is not durable — add a replica + snapshot policy before production; report/fraud jobs must query ES, not Postgres joins.
+- **ES hardening**: single-node ES is not durable — add a replica + snapshot policy before production; report/fraud jobs must query ES, not Postgres joins. Elasticsearch also still runs with `xpack.security` off, kept off the public network rather than authenticated.
+- **Refresh-token reuse detection**: rotation and revocation are in place; detecting a *replayed* old refresh token and killing the whole family is the next step.
 
 Build order: **P1 money & identity → P2 live ops → P3 validation & ETA → P4 reports & polish**.
 

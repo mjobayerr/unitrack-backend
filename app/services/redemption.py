@@ -53,6 +53,15 @@ def _check_valid_window(ticket: Ticket, now: datetime) -> None:
     """
     if ticket.status is TicketStatus.revoked:
         raise RedemptionRejected("ticket revoked")
+    # Suspension has to bite here, not only in the manifest. `GET
+    # /helper/manifest` already omits everything that is not `active`, so an
+    # online helper never receives a suspended ticket's public key — but a helper
+    # holding a manifest downloaded *before* the sweep ran still validates the
+    # code offline and syncs the boarding afterwards. Without this check that
+    # sync deducts a ride and is filed as a clean boarding, which defeats the
+    # suspension for the one attacker it was raised against.
+    if ticket.status is TicketStatus.suspended:
+        raise RedemptionRejected("ticket suspended pending review")
     if ticket.status is TicketStatus.expired or ticket.valid_to < now:
         raise RedemptionRejected("ticket expired")
     if ticket.valid_from > now:

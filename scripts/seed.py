@@ -98,10 +98,30 @@ _ALL_EMAILS = (
 )
 
 _BUSES = [
-    {"reg_no": "UA-METRO-01", "nickname": "Campus Express 1", "capacity": 45, "status": BusStatus.active},
-    {"reg_no": "UA-METRO-02", "nickname": "Campus Express 2", "capacity": 45, "status": BusStatus.active},
-    {"reg_no": "UA-METRO-03", "nickname": "City Link",         "capacity": 30, "status": BusStatus.active},
-    {"reg_no": "UA-METRO-04", "nickname": "Night Runner",      "capacity": 30, "status": BusStatus.inactive},
+    {
+        "reg_no": "UA-METRO-01",
+        "nickname": "Campus Express 1",
+        "capacity": 45,
+        "status": BusStatus.active,
+    },
+    {
+        "reg_no": "UA-METRO-02",
+        "nickname": "Campus Express 2",
+        "capacity": 45,
+        "status": BusStatus.active,
+    },
+    {
+        "reg_no": "UA-METRO-03",
+        "nickname": "City Link",
+        "capacity": 30,
+        "status": BusStatus.active,
+    },
+    {
+        "reg_no": "UA-METRO-04",
+        "nickname": "Night Runner",
+        "capacity": 30,
+        "status": BusStatus.inactive,
+    },
 ]
 
 # (name, lat, lng) — south to north
@@ -432,7 +452,9 @@ async def _seed_trips(db: AsyncSession) -> list[Trip]:
             raise RuntimeError(f"User {h['email']} not found — run: python -m scripts.seed users")
         row = (await db.execute(select(Helper).where(Helper.user_id == u.id))).scalar_one_or_none()
         if row is None:
-            raise RuntimeError(f"Helper row for {h['email']} missing — run: python -m scripts.seed users")
+            raise RuntimeError(
+                f"Helper row for {h['email']} missing — run: python -m scripts.seed users"
+            )
         helper_users.append(u)
         helper_rows.append(row)
 
@@ -498,7 +520,7 @@ async def _seed_reports(db: AsyncSession) -> list[SeatReport]:
             raise RuntimeError(f"User {h['email']} not found — run: python -m scripts.seed users")
         row = (await db.execute(select(Helper).where(Helper.user_id == u.id))).scalar_one_or_none()
         if row is None:
-            raise RuntimeError(f"Helper row missing — run: python -m scripts.seed users")
+            raise RuntimeError("Helper row missing — run: python -m scripts.seed users")
         helper_rows.append(row)
 
     completed = (await db.execute(
@@ -545,7 +567,9 @@ async def _seed_alerts(db: AsyncSession) -> list[Alert]:
     if not h1_user or not h2_user:
         raise RuntimeError("Helper users not found — run: python -m scripts.seed users")
 
-    h1_row = (await db.execute(select(Helper).where(Helper.user_id == h1_user.id))).scalar_one_or_none()
+    h1_row = (
+        await db.execute(select(Helper).where(Helper.user_id == h1_user.id))
+    ).scalar_one_or_none()
     live_trip = None
     if h1_row:
         live_trip = (await db.execute(
@@ -629,10 +653,16 @@ def _print_summary(results: dict, groups: list[str]) -> None:
 
     if "trips" in groups and "trips" in results:
         trips = results["trips"]
-        labels = ["LIVE  (started ~30 min ago)", "DONE  (yesterday)",         "DONE  (2 days ago)"]
+        labels = [
+            "LIVE  (started ~30 min ago)",
+            "DONE  (yesterday)",
+            "DONE  (2 days ago)",
+        ]
         print()
         print("  TRIPS")
-        for trip, label in zip(trips, labels):
+        # strict=True so adding a seeded trip without a label fails loudly here
+        # rather than silently printing a short list.
+        for trip, label in zip(trips, labels, strict=True):
             print(f"  {label:<30}  id={trip.id}")
 
     if "reports" in groups and "reports" in results:

@@ -51,6 +51,26 @@ def test_a_ticket_not_yet_valid_is_refused() -> None:
         _check_valid_window(_Ticket(days_until_valid=2), datetime.now(UTC))
 
 
+def test_a_suspended_ticket_is_refused() -> None:
+    """Suspension has to bite on the sync path, not just in the manifest.
+
+    The fraud sweep suspends a ticket whose code turned up on several devices.
+    `GET /helper/manifest` already omits anything that is not `active`, so an
+    online helper never gets the public key — but a helper who downloaded the
+    manifest *before* the suspension still holds it, validates the code offline,
+    and posts the boarding to `POST /helper/redemptions` later. If the window
+    check ignores `suspended`, that sync deducts a ride and is recorded as a
+    clean `ok` boarding, so the suspension buys nothing against the one attacker
+    it was raised for.
+
+    Refused rather than recorded-as-duplicate: unlike the exhausted case above,
+    there is no ambiguity to preserve here. The server already decided this
+    ticket is under review.
+    """
+    with pytest.raises(RedemptionRejected, match="suspended"):
+        _check_valid_window(_Ticket(status=TicketStatus.suspended), datetime.now(UTC))
+
+
 def test_running_out_of_rides_is_not_part_of_the_window_check() -> None:
     """The ordering here is load-bearing, and getting it wrong cost real
     evidence during testing.

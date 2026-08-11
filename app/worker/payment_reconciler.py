@@ -50,11 +50,39 @@ BATCH = 50
 
 
 async def _unsettled(db, cutoff: datetime) -> list[Order]:
+    """Orders whose real outcome the gateway has never confirmed to us.
+
+    `initiated` and `pending` are the obvious ones. `failed` and `cancelled` are
+    included too, but **only when `raw_payload` is NULL**, and that condition is
+    the whole point:
+
+    `raw_payload` is written in exactly one place — `apply_validation`, after a
+    server-to-server validation call. So a NULL payload on a closed order means
+    it was closed from the unverified `status` field that SSLCommerz POSTs to the
+    return and IPN handlers, and nothing ever checked that claim against the
+    gateway.
+
+    That matters because a transaction can carry several attempts: a declined
+    card followed by a successful wallet. If the declined attempt's report lands
+    first, `_settle` marks the order `failed`. Were this query to trust that, the
+    order would drop out of the reconciler's reach forever — and if the success
+    report then went missing (a closed tab, a dropped IPN) the money would be
+    gone with no ticket and nothing left to notice it.
+
+    A genuinely abandoned checkout costs one gateway query per pass until
+    `ABANDON_H`, which then closes it for good. That is a cheap price for not
+    silently keeping someone's money.
+    """
+    never_confirmed = Order.raw_payload.is_(None)
     stmt = (
         select(Order)
         .where(
-            Order.status.in_((OrderStatus.initiated, OrderStatus.pending)),
             Order.created_at < cutoff,
+            Order.status.in_((OrderStatus.initiated, OrderStatus.pending))
+            | (
+                Order.status.in_((OrderStatus.failed, OrderStatus.cancelled))
+                & never_confirmed
+            ),
         )
         .order_by(Order.created_at)
         .limit(BATCH)
@@ -104,7 +132,13 @@ async def reconcile_once(gateway: SslCommerzClient) -> dict[str, int]:
                 if age_h >= ABANDON_H:
                     # The gateway has no record of money for this. Abandoned
                     # checkout, not a lost payment.
-                    order.status = OrderStatus.failed
+                    #
+                    # `cancelled` is left as it is: the student deliberately
+                    # backed out, and that reads differently in a wallet than a
+                    # payment that failed. Only genuinely open orders become
+                    # `failed` here.
+                    if order.status is not OrderStatus.cancelled:
+                        order.status = OrderStatus.failed
                     tally["abandoned"] += 1
                     logger.info("abandoning order %s after %.0fh unpaid", order.id, age_h)
                 else:
