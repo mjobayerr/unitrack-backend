@@ -51,6 +51,7 @@ Both run in CI on every push ([`.github/workflows/ci.yml`](.github/workflows/ci.
 | **ETA engine** — rolling observed speed near stops, schedule further out (spec §7.4) | ✅ |
 | **Admin catalog CRUD** — products, stops, routes (no psql needed) | ✅ |
 | **Email/SMTP** — student verification actually sends | ✅ |
+| **Live fleet map** — `GET /admin/fleet`, positions from Redis + GPS-freshness (spec §10.2) | ✅ |
 
 **Not built yet** — in the spec, not started (roadmap order):
 
@@ -220,6 +221,7 @@ curl "localhost:8000/track/nearby?lat=23.78&lng=90.40&radius_km=5"
 | POST | `/helper/gps` | Ingest a batch of fixes (approved helper only). |
 | POST | `/helper/seats` | Report occupancy for the live trip. |
 | POST | `/helper/alerts` | Raise an alert (SOS / breakdown / …); severity set server-side. |
+| GET | `/admin/fleet` | Every live trip: position, freshness, seats, next stop. **admin** |
 | GET | `/admin/alerts` | Open alerts, worst first. **admin** |
 | POST | `/admin/alerts/{id}/acknowledge` | Claim an alert. **admin** |
 | POST | `/admin/alerts/{id}/resolve` | Close an alert with a note. **admin** |
