@@ -30,3 +30,22 @@ class GpsAccepted(BaseModel):
     # — ingest refuses a batch it cannot attribute to a trip. Kept optional only
     # so an older client still parses the response.
     trip_id: uuid.UUID | None = None
+
+class GpsPoint(BaseModel):
+    """Single GPS coordinate with timestamp and metadata."""
+    timestamp: datetime
+    latitude: float
+    longitude: float
+    speed: float | None = None
+    heading: float | None = None
+    accuracy: float | None = None
+
+
+class BusHistoryPathOut(BaseModel):
+    """Response model for bus history path endpoint."""
+    bus_id: uuid.UUID
+    trip_id: uuid.UUID | None = None
+    from_timestamp: datetime
+    to_timestamp: datetime
+    point_count: int
+    path: list[GpsPoint]
