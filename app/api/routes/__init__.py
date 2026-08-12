@@ -20,6 +20,7 @@ from app.api.routes import (
     admin_catalog,
     auth,
     boarding,
+    bus_track,
     fleet,
     helper,
     shop,
@@ -34,6 +35,7 @@ ROUTERS: tuple[APIRouter, ...] = (
     auth.router,
     admin.router,
     admin_catalog.router,
+    bus_track.router,
     fleet.router,
     helper.router,
     tracking.router,
@@ -60,6 +62,7 @@ PUBLIC_PATHS: frozenset[str] = frozenset(
         "/auth/resend-verification",
         "/auth/login",  # issues the credential
         "/auth/refresh",  # the refresh token IS the credential
+        "/bus-track",  # public read-only bus location lookup for clients
         # The payment gateway redirects the student's browser here with a
         # form POST that carries no credential of ours. Authenticating it is
         # impossible; instead nothing in the request is trusted, and the
