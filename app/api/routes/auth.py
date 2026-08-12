@@ -28,8 +28,10 @@ from app.schemas.auth import (
     HelperRegister,
     LoginRequest,
     LogoutRequest,
+    MeOut,
     RefreshRequest,
     ResendVerification,
+    StudentProfileOut,
     StudentRegister,
     TokenPair,
     UserOut,
@@ -367,6 +369,29 @@ async def logout(
             await revoke(r, refresh_claims)
 
 
-@router.get("/me", response_model=UserOut)
-async def me(user: User = Depends(get_current_user)) -> User:
-    return user
+@router.get("/me", response_model=MeOut)
+async def me(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> MeOut:
+    """The signed-in account plus the profile registration collected.
+
+    The student row is a second SELECT rather than an eager join because
+    `get_current_user` is shared by every authenticated route and most do not
+    need it — the cost belongs here, at the one endpoint that returns a profile.
+    Only students have a row; helpers and admins fall through with `student`
+    null.
+    """
+    student: Student | None = None
+    if user.role == UserRole.student:
+        student = await db.scalar(select(Student).where(Student.user_id == user.id))
+
+    return MeOut(
+        id=user.id,
+        email=user.email,
+        name=user.name,
+        role=user.role,
+        status=user.status,
+        phone=user.phone,
+        student=StudentProfileOut.model_validate(student) if student else None,
+    )
