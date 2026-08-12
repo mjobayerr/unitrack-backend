@@ -1,3 +1,41 @@
+# UniTrack — the whole system, locally.
+#
+#   cp .env.example .env
+#   docker compose up -d --build
+#
+# Brings up Postgres, Redis, Elasticsearch, the API, the background workers, the
+# nginx edge, and both web apps. One command, nothing else to start.
+#
+#   Student app   http://localhost:3001
+#   Admin console http://localhost:3000
+#   API docs      http://localhost:8000/docs
+#   Edge (nginx)  http://localhost:8081     <- same path a request takes in prod
+#
+# Every host port above is overridable in .env (STUDENT_PORT, ADMIN_PORT,
+# API_PORT_HOST, EDGE_PORT). Not gratuitous configurability: a port already taken
+# on the host fails the whole `up` with "ports are not available", and the fix
+# should not be editing a checked-in file.
+#
+# Add demo traffic — two buses driving the Dhaka route, so both maps have
+# something live to show:
+#
+#   docker compose --profile demo up -d
+#
+# Wipe everything and start clean:
+#
+#   docker compose down -v
+#
+# There is exactly one other compose file, docker-compose.cloudflared.yml, which
+# is the same system published through a Cloudflare Tunnel. Two files, two
+# environments; anything that has to differ differs in .env, not in YAML.
+
+name: unitrack
+
+# Ports bind to 127.0.0.1, never to 0.0.0.0. `"5433:5432"` is not the same as
+# `"127.0.0.1:5433:5432"`: the short form listens on every interface and puts
+# the database on whatever network the laptop is joined to, coffee-shop wifi
+# included. The offsets (5433/6380/9201) leave the standard ports free for
+# anything already installed on the host.
 services:
   postgres:
     image: postgres:16
@@ -5,8 +43,11 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-unitrack}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-unitrack}
       POSTGRES_DB: ${POSTGRES_DB:-unitrack}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT_HOST:-5433}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-unitrack}"]
       interval: 5s
@@ -16,8 +57,11 @@ services:
   redis:
     image: redis:7
     command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT_HOST:-6380}:6379"
     volumes:
       - redis-data:/data
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -28,46 +72,147 @@ services:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
     environment:
       discovery.type: single-node
+      # Security stays ON locally even though nothing outside Docker can reach
+      # it. The app only sends credentials when both ELASTICSEARCH_USER and
+      # ELASTICSEARCH_PASSWORD are set, so a dev stack with auth off is a dev
+      # stack where that code path is never exercised — and it is the path that
+      # breaks in production.
       xpack.security.enabled: "true"
-      ELASTIC_PASSWORD: "dev_elastic_password"
-      ES_JAVA_OPTS: "-Xms1024m -Xmx1024m"
+      ELASTIC_PASSWORD: ${ELASTICSEARCH_PASSWORD:-dev_elastic_password}
+      ES_JAVA_OPTS: ${ES_JAVA_OPTS:--Xms1024m -Xmx1024m}
+    ports:
+      - "127.0.0.1:${ES_PORT_HOST:-9201}:9200"
     volumes:
       - es-data:/usr/share/elasticsearch/data
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf -u elastic:dev_elastic_password http://localhost:9200/_cluster/health || exit 1"]
+      test:
+        - CMD-SHELL
+        - curl -sf -u elastic:${ELASTICSEARCH_PASSWORD:-dev_elastic_password} http://localhost:9200/_cluster/health || exit 1
       interval: 10s
       timeout: 5s
       retries: 12
 
-  api:
+  # One-shot: migrate, then seed. Runs on every `up` and exits.
+  #
+  # Idempotent by design — Alembic skips applied revisions and the seeder skips
+  # rows that already exist, so restarting the stack does not touch data you
+  # have created by hand. `down -v` is the only thing that wipes.
+  init:
     build: .
     env_file: .env
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      elasticsearch:
-        condition: service_healthy
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      elasticsearch: {condition: service_healthy}
+    restart: "no"
+    command: >
+      sh -c "
+        alembic upgrade head &&
+        python -m scripts.seed all --keep &&
+        echo '--- database ready ---'
+      "
+
+  api:
+    build: .
+    env_file: .env
+    ports:
+      - "127.0.0.1:${API_PORT_HOST:-8000}:8000"
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      elasticsearch: {condition: service_healthy}
+      init: {condition: service_completed_successfully}
+    restart: unless-stopped
+    healthcheck:
+      # python, not curl: the api image is python:3.12-slim and has no curl.
+      # Installing one to run a healthcheck would be a package in the image
+      # forever for the sake of six characters.
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health',timeout=3).status==200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
 
   worker:
     build: .
     command: ["python", "-m", "app.worker"]
     env_file: .env
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      elasticsearch:
-        condition: service_healthy
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      elasticsearch: {condition: service_healthy}
+      init: {condition: service_completed_successfully}
+    restart: unless-stopped
 
   nginx:
     image: nginx:1.27
     depends_on:
-      - api
+      api: {condition: service_healthy}
+    ports:
+      # Published so the rate limits and header rules can be exercised on the
+      # same path a real request takes, instead of being discovered in prod.
+      - "127.0.0.1:${EDGE_PORT:-8081}:80"
     volumes:
       - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped
+
+  # --- web -------------------------------------------------------------------
+  # Built from the sibling repo. Keeping them here rather than in a third
+  # compose file is deliberate: the apps are useless without the API, and two
+  # files that must be brought up in the right order is a step to forget.
+  admin:
+    build:
+      context: ../unitrack-web
+      args:
+        APP: admin
+    environment:
+      # The service name, not localhost: this runs inside a container, and it
+      # deliberately skips nginx. nginx rate-limits per client IP, which for
+      # server-side calls is this one container — every operator would share a
+      # single bucket and start seeing 429s under ordinary use.
+      UNITRACK_API_URL: http://api:8000
+      PORT: "3000"
+    ports:
+      - "127.0.0.1:${ADMIN_PORT:-3000}:3000"
+    depends_on:
+      api: {condition: service_healthy}
+    restart: unless-stopped
+
+  student:
+    build:
+      context: ../unitrack-web
+      args:
+        APP: student
+    environment:
+      UNITRACK_API_URL: http://api:8000
+      PORT: "3001"
+    ports:
+      - "127.0.0.1:${STUDENT_PORT:-3001}:3001"
+    depends_on:
+      api: {condition: service_healthy}
+    restart: unless-stopped
+
+  # --- demo traffic ----------------------------------------------------------
+  # Off unless asked for: `docker compose --profile demo up -d`.
+  #
+  # Signs in as the seeded helpers and posts GPS batches over HTTP exactly as a
+  # phone does, so the maps are fed through the real ingest path — nginx, the
+  # API, the Redis stream, the Elasticsearch indexer. Writing positions straight
+  # into Redis would light up the maps while proving nothing about the pipeline
+  # that carries them in production.
+  simulator:
+    build: .
+    command: ["python", "-m", "scripts.dev_simulate_gps"]
+    env_file: .env
+    environment:
+      SIM_API_URL: http://api:8000
+    depends_on:
+      api: {condition: service_healthy}
+    restart: unless-stopped
+    profiles: [demo]
 
 volumes:
   postgres-data:

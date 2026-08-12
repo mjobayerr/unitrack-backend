@@ -10,7 +10,8 @@ Usage
     python -m scripts.seed                  seed everything (asks before overwriting)
     python -m scripts.seed all              same
     python -m scripts.seed users buses      seed specific groups only
-    python -m scripts.seed all --wipe       skip the confirmation prompt
+    python -m scripts.seed all --wipe       no prompt: wipe seed rows and redo them
+    python -m scripts.seed all --keep       no prompt: leave existing rows alone
 
 Groups (seed order)
 -------------------
@@ -18,9 +19,10 @@ Groups (seed order)
     buses     4 buses (3 active, 1 inactive)
     stops     7 stops along the Dhanmondi -> Uttara corridor
     routes    Campus Shuttle outbound + inbound (with stop sequences)
-    trips     1 live trip (in progress), 2 completed trips
+    trips     2 live trips (one each way), 2 completed trips
     reports   5 seat reports spread across the completed trips
     alerts    2 open alerts (1 critical SOS, 1 warning breakdown)
+    commerce  3 ticket products + a paid order and active ticket for student1
 
 Accounts seeded
 ---------------
@@ -44,6 +46,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import hash_password
 from app.db.session import SessionLocal
+from app.models.commerce import (
+    Order,
+    OrderStatus,
+    ProductType,
+    Redemption,
+    Ticket,
+    TicketProduct,
+)
 from app.models.fleet import (
     Bus,
     BusStatus,
@@ -63,6 +73,7 @@ from app.models.ops import (
     SeatReport,
 )
 from app.models.user import Helper, HelperStatus, Student, User, UserRole, UserStatus
+from app.services.settlement import issue_ticket
 
 # ---------------------------------------------------------------------------
 # Static seed data
@@ -98,10 +109,30 @@ _ALL_EMAILS = (
 )
 
 _BUSES = [
-    {"reg_no": "UA-METRO-01", "nickname": "Campus Express 1", "capacity": 45, "status": BusStatus.active},
-    {"reg_no": "UA-METRO-02", "nickname": "Campus Express 2", "capacity": 45, "status": BusStatus.active},
-    {"reg_no": "UA-METRO-03", "nickname": "City Link",         "capacity": 30, "status": BusStatus.active},
-    {"reg_no": "UA-METRO-04", "nickname": "Night Runner",      "capacity": 30, "status": BusStatus.inactive},
+    {
+        "reg_no": "UA-METRO-01",
+        "nickname": "Campus Express 1",
+        "capacity": 45,
+        "status": BusStatus.active,
+    },
+    {
+        "reg_no": "UA-METRO-02",
+        "nickname": "Campus Express 2",
+        "capacity": 45,
+        "status": BusStatus.active,
+    },
+    {
+        "reg_no": "UA-METRO-03",
+        "nickname": "City Link",
+        "capacity": 30,
+        "status": BusStatus.active,
+    },
+    {
+        "reg_no": "UA-METRO-04",
+        "nickname": "Night Runner",
+        "capacity": 30,
+        "status": BusStatus.inactive,
+    },
 ]
 
 # (name, lat, lng) — south to north
@@ -118,25 +149,64 @@ _STOPS = [
 _ROUTE_NAME = "Campus Shuttle"
 _ROUTE_OFFSETS = [0, 8, 18, 32, 40, 58, 70]  # minutes from trip start
 
+# Prices in paisa, which is how the whole system stores money — 1 BDT = 100
+# paisa. Integers all the way to the gateway, because a fare is never a float.
+_PRODUCTS = [
+    {
+        "name": "Single Ride",
+        "type": ProductType.single,
+        "price_paisa": 3000,      # 30 BDT
+        "ride_count": 1,
+        "validity_days": 7,
+    },
+    {
+        "name": "10-Ride Pack",
+        "type": ProductType.bulk,
+        "price_paisa": 25000,     # 250 BDT — a ride cheaper than ten singles
+        "ride_count": 10,
+        "validity_days": 60,
+    },
+    {
+        "name": "Monthly Pass",
+        "type": ProductType.package,
+        # ride_count None means unlimited: `Ticket.rides_remaining` stays NULL
+        # and redemption stops checking a ride budget that does not exist.
+        "price_paisa": 90000,     # 900 BDT
+        "ride_count": None,
+        "validity_days": 30,
+    },
+]
+
+# The seeded student's paid order. `tran_id` is what the gateway echoes back, so
+# the prefix makes a seeded order obvious in the orders table and impossible to
+# confuse with a real settlement.
+_SEED_TRAN_PREFIX = "SEED-"
+
 # ---------------------------------------------------------------------------
 # Seed order and wipe dependency map
 # ---------------------------------------------------------------------------
 
 # Groups must be seeded in this order (each depends on the ones before it).
-SEED_ORDER = ["users", "buses", "stops", "routes", "trips", "reports", "alerts"]
+SEED_ORDER = [
+    "users", "buses", "stops", "routes", "trips", "reports", "alerts", "commerce",
+]
 
 # To safely wipe group G, these groups must be wiped first (FK RESTRICT chains).
 # trips RESTRICT on buses, routes, helpers; helpers CASCADE from users;
 # route_stops RESTRICT on stops (but CASCADE from routes); seat_reports RESTRICT
 # on helpers (but CASCADE from trips). Wiping trips first untangles everything.
+#
+# commerce is in `users` because orders and tickets both reference the student
+# row: deleting the seeded users first hits a RESTRICT on orders.student_id.
 _WIPE_REQUIRES: dict[str, list[str]] = {
-    "alerts":  [],
-    "reports": [],
-    "trips":   [],
-    "routes":  ["trips"],
-    "stops":   ["trips", "routes"],
-    "buses":   ["trips"],
-    "users":   ["trips"],
+    "alerts":   [],
+    "reports":  [],
+    "trips":    [],
+    "commerce": [],
+    "routes":   ["trips"],
+    "stops":    ["trips", "routes"],
+    "buses":    ["trips"],
+    "users":    ["trips", "commerce"],
 }
 
 # Wipe is always done in reverse seed order, filtered to the effective set.
@@ -246,10 +316,17 @@ async def _count_alerts(db: AsyncSession) -> int:
     )).scalar_one()
 
 
+async def _count_commerce(db: AsyncSession) -> int:
+    return (await db.execute(
+        select(func.count()).select_from(TicketProduct)
+        .where(TicketProduct.name.in_([p["name"] for p in _PRODUCTS]))
+    )).scalar_one()
+
+
 _COUNT_FNS = {
     "users": _count_users, "buses": _count_buses, "stops": _count_stops,
     "routes": _count_routes, "trips": _count_trips, "reports": _count_reports,
-    "alerts": _count_alerts,
+    "alerts": _count_alerts, "commerce": _count_commerce,
 }
 
 # ---------------------------------------------------------------------------
@@ -309,10 +386,31 @@ async def _wipe_users(db: AsyncSession) -> int:
     return r.rowcount
 
 
+async def _wipe_commerce(db: AsyncSession) -> int:
+    """Remove seeded products and everything hanging off them.
+
+    Deleted innermost-first — redemptions, tickets, orders, then products —
+    because every one of those foreign keys is RESTRICT. Scoped to the seeded
+    product names so a real order placed against a real product survives a
+    reseed; the sub-selects are what keeps that scope, rather than a bare
+    `delete(Ticket)` that would empty the wallet of anyone using the stack.
+    """
+    product_ids = select(TicketProduct.id).where(
+        TicketProduct.name.in_([p["name"] for p in _PRODUCTS])
+    )
+    ticket_ids = select(Ticket.id).where(Ticket.product_id.in_(product_ids))
+
+    await db.execute(delete(Redemption).where(Redemption.ticket_id.in_(ticket_ids)))
+    await db.execute(delete(Ticket).where(Ticket.product_id.in_(product_ids)))
+    await db.execute(delete(Order).where(Order.product_id.in_(product_ids)))
+    r = await db.execute(delete(TicketProduct).where(TicketProduct.id.in_(product_ids)))
+    return r.rowcount
+
+
 _WIPE_FNS = {
     "alerts": _wipe_alerts, "reports": _wipe_reports, "trips": _wipe_trips,
     "routes": _wipe_routes, "stops": _wipe_stops, "buses": _wipe_buses,
-    "users": _wipe_users,
+    "users": _wipe_users, "commerce": _wipe_commerce,
 }
 
 # ---------------------------------------------------------------------------
@@ -432,13 +530,16 @@ async def _seed_trips(db: AsyncSession) -> list[Trip]:
             raise RuntimeError(f"User {h['email']} not found — run: python -m scripts.seed users")
         row = (await db.execute(select(Helper).where(Helper.user_id == u.id))).scalar_one_or_none()
         if row is None:
-            raise RuntimeError(f"Helper row for {h['email']} missing — run: python -m scripts.seed users")
+            raise RuntimeError(
+                f"Helper row for {h['email']} missing — run: python -m scripts.seed users"
+            )
         helper_users.append(u)
         helper_rows.append(row)
 
     bus1 = await _bus(db, "UA-METRO-01")
     bus2 = await _bus(db, "UA-METRO-02")
-    if not bus1 or not bus2:
+    bus3 = await _bus(db, "UA-METRO-03")
+    if not bus1 or not bus2 or not bus3:
         raise RuntimeError("Buses not found — run: python -m scripts.seed buses")
 
     outbound = await _route(db, RouteDirection.outbound)
@@ -458,6 +559,24 @@ async def _seed_trips(db: AsyncSession) -> list[Trip]:
         status=TripStatus.live,
     )
     db.add(t1)
+    await db.flush()
+
+    # Trip 1b — LIVE the other way, started ~15 min ago.
+    #
+    # Two live trips rather than one, because a single bus proves nothing about
+    # a *fleet*: the admin map's per-bus pins, and a student who wants the bus
+    # heading their way rather than the one that just passed, both need the
+    # inbound direction to exist. A second helper is required, not a stylistic
+    # choice — `uq_trips_one_live_per_helper` is a partial unique index that
+    # allows exactly one live trip per helper.
+    t1b = Trip(
+        route_id=inbound.id, bus_id=bus3.id, helper_id=helper_rows[1].id,
+        service_date=today,
+        scheduled_start=now - timedelta(minutes=20),
+        actual_start=now - timedelta(minutes=15),
+        status=TripStatus.live,
+    )
+    db.add(t1b)
     await db.flush()
 
     # Trip 2 — COMPLETED, yesterday (inbound, helper2)
@@ -487,7 +606,7 @@ async def _seed_trips(db: AsyncSession) -> list[Trip]:
     await db.flush()
 
     await db.commit()
-    return [t1, t2, t3]
+    return [t1, t1b, t2, t3]
 
 
 async def _seed_reports(db: AsyncSession) -> list[SeatReport]:
@@ -498,7 +617,7 @@ async def _seed_reports(db: AsyncSession) -> list[SeatReport]:
             raise RuntimeError(f"User {h['email']} not found — run: python -m scripts.seed users")
         row = (await db.execute(select(Helper).where(Helper.user_id == u.id))).scalar_one_or_none()
         if row is None:
-            raise RuntimeError(f"Helper row missing — run: python -m scripts.seed users")
+            raise RuntimeError("Helper row missing — run: python -m scripts.seed users")
         helper_rows.append(row)
 
     completed = (await db.execute(
@@ -545,7 +664,9 @@ async def _seed_alerts(db: AsyncSession) -> list[Alert]:
     if not h1_user or not h2_user:
         raise RuntimeError("Helper users not found — run: python -m scripts.seed users")
 
-    h1_row = (await db.execute(select(Helper).where(Helper.user_id == h1_user.id))).scalar_one_or_none()
+    h1_row = (
+        await db.execute(select(Helper).where(Helper.user_id == h1_user.id))
+    ).scalar_one_or_none()
     live_trip = None
     if h1_row:
         live_trip = (await db.execute(
@@ -580,10 +701,83 @@ async def _seed_alerts(db: AsyncSession) -> list[Alert]:
     return alerts
 
 
+async def _seed_commerce(db: AsyncSession) -> list[TicketProduct]:
+    """The shop's catalogue, plus one already-paid ticket in student1's wallet.
+
+    The ticket matters more than it looks. Without it the wallet renders its
+    empty state and the boarding QR — the one screen the helper app scans, and
+    the hardest thing in the system to test — has nothing to draw. Seeding a
+    ticket means a fresh stack can be scanned end to end.
+
+    It is created through `issue_ticket`, the same function the payment callback
+    calls, rather than by hand. A hand-built row would need its own Ed25519
+    keypair and its own validity arithmetic, and would then drift from the real
+    one silently — the seeded ticket would keep working after a change that
+    broke every ticket a student actually bought.
+    """
+    products: list[TicketProduct] = []
+    for spec in _PRODUCTS:
+        existing = (await db.execute(
+            select(TicketProduct).where(TicketProduct.name == spec["name"])
+        )).scalar_one_or_none()
+        if existing is None:
+            existing = TicketProduct(**spec, active=True)
+            db.add(existing)
+            await db.flush()
+        products.append(existing)
+    await db.commit()
+
+    user = await _user(db, _STUDENTS[0]["email"])
+    if user is None:
+        raise RuntimeError(
+            f"User {_STUDENTS[0]['email']} not found — run: python -m scripts.seed users"
+        )
+    # `orders.student_id` references `students.id`, not `users.id`. The two are
+    # different rows with different ids, and passing the user's gets a
+    # ForeignKeyViolationError naming a table the caller never mentioned.
+    student = (
+        await db.execute(select(Student).where(Student.user_id == user.id))
+    ).scalar_one_or_none()
+    if student is None:
+        raise RuntimeError(
+            f"{_STUDENTS[0]['email']} has no student row — run: python -m scripts.seed users"
+        )
+
+    # The 10-ride pack: a ticket with rides left is the more interesting fixture,
+    # since it exercises the decrement path that a single ride never reaches
+    # twice and an unlimited pass never reaches at all.
+    pack = products[1]
+    tran_id = f"{_SEED_TRAN_PREFIX}{student.id.hex[:12]}"
+
+    order = (await db.execute(
+        select(Order).where(Order.tran_id == tran_id)
+    )).scalar_one_or_none()
+    if order is not None:
+        return products
+
+    now = datetime.now(UTC)
+    order = Order(
+        student_id=student.id,
+        product_id=pack.id,
+        amount_paisa=pack.price_paisa,
+        currency="BDT",
+        status=OrderStatus.paid,
+        idempotency_key=tran_id,
+        tran_id=tran_id,
+        gateway="seed",
+        paid_at=now - timedelta(days=1),
+    )
+    db.add(order)
+    await db.flush()
+    await issue_ticket(db, order)
+    await db.commit()
+    return products
+
+
 _SEED_FNS = {
     "users": _seed_users, "buses": _seed_buses, "stops": _seed_stops,
     "routes": _seed_routes, "trips": _seed_trips, "reports": _seed_reports,
-    "alerts": _seed_alerts,
+    "alerts": _seed_alerts, "commerce": _seed_commerce,
 }
 
 # ---------------------------------------------------------------------------
@@ -629,10 +823,17 @@ def _print_summary(results: dict, groups: list[str]) -> None:
 
     if "trips" in groups and "trips" in results:
         trips = results["trips"]
-        labels = ["LIVE  (started ~30 min ago)", "DONE  (yesterday)",         "DONE  (2 days ago)"]
+        labels = [
+            "LIVE  outbound, started ~30 min ago",
+            "LIVE  inbound, started ~15 min ago",
+            "DONE  (yesterday)",
+            "DONE  (2 days ago)",
+        ]
         print()
         print("  TRIPS")
-        for trip, label in zip(trips, labels):
+        # strict=True so adding a seeded trip without a label fails loudly here
+        # rather than silently printing a short list.
+        for trip, label in zip(trips, labels, strict=True):
             print(f"  {label:<30}  id={trip.id}")
 
     if "reports" in groups and "reports" in results:
@@ -645,6 +846,18 @@ def _print_summary(results: dict, groups: list[str]) -> None:
         print("  - CRITICAL  SOS — passenger medical emergency  [Farmgate]")
         print("  - WARNING   Breakdown — unusual bus noise       [Mohakhali]")
 
+    if "commerce" in groups and "commerce" in results:
+        print()
+        print("  TICKET PRODUCTS")
+        for product in results["commerce"]:
+            rides = "unlimited" if product.ride_count is None else f"{product.ride_count} ride(s)"
+            print(
+                f"  {product.name:<16}  {product.price_paisa / 100:>7.2f} BDT  "
+                f"{rides:<12}  {product.validity_days}d"
+            )
+        print()
+        print(f"  WALLET  {_STUDENTS[0]['email']} holds a paid 10-Ride Pack")
+
     print()
     print(sep)
 
@@ -653,7 +866,22 @@ def _print_summary(results: dict, groups: list[str]) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
-async def _run(groups: list[str], force_wipe: bool) -> None:
+def _confirm_wipe() -> str:
+    """Ask before destroying data. Refuses rather than guessing when nobody can answer.
+
+    `input()` raises EOFError with no stdin — which is every non-interactive
+    caller: a compose `command:`, a CI step, a piped shell. The traceback that
+    came out of that looked like a database failure and said nothing about the
+    flag that fixes it.
+    """
+    try:
+        return input("Wipe and reseed? [y/N] ").strip().lower()
+    except EOFError:
+        print("\nNo terminal to ask on. Pass --wipe to replace the data, or --keep to leave it.")
+        return "n"
+
+
+async def _run(groups: list[str], force_wipe: bool, keep: bool) -> None:
     async with SessionLocal() as db:
         # 1. Count existing seed data in targeted groups
         counts: dict[str, int] = {}
@@ -662,13 +890,29 @@ async def _run(groups: list[str], force_wipe: bool) -> None:
 
         dirty = {g: c for g, c in counts.items() if c > 0}
 
-        # 2. If data exists, ask (or use --wipe)
-        if dirty:
+        # 2. --keep: leave what is there and seed only the empty groups.
+        #
+        # Skipping the group entirely, not just the wipe. `_seed_trips`,
+        # `_seed_reports` and `_seed_alerts` add rows unconditionally — running
+        # them against a seeded database would file a second live trip per
+        # helper and hit `uq_trips_one_live_per_helper`, which is the partial
+        # unique index that exists precisely to stop that. This is the flag the
+        # `init` container uses on every `docker compose up`, so "already seeded"
+        # has to be a no-op rather than a crash loop.
+        if keep:
+            if dirty:
+                print(f"Keeping existing: {', '.join(f'{g} ({c})' for g, c in dirty.items())}")
+            groups = [g for g in groups if g not in dirty]
+            if not groups:
+                print("Nothing to seed — every group already has data.")
+                return
+
+        if dirty and not keep:
             if not force_wipe:
                 print("Existing seed data found:")
                 for g, c in dirty.items():
                     print(f"  {g}: {c} row(s)")
-                answer = input("Wipe and reseed? [y/N] ").strip().lower()
+                answer = _confirm_wipe()
                 if answer != "y":
                     print("Aborted — nothing changed.")
                     return
@@ -716,12 +960,18 @@ def main() -> None:
         nargs="*",
         default=["all"],
         metavar="GROUP",
-        help="Groups to seed: all users buses stops routes trips reports alerts",
+        help=f"Groups to seed: all {' '.join(SEED_ORDER)}",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--wipe",
         action="store_true",
-        help="Skip the confirmation prompt and wipe existing seed data automatically.",
+        help="No prompt: remove the existing seed rows and create them again.",
+    )
+    mode.add_argument(
+        "--keep",
+        action="store_true",
+        help="No prompt: seed only the groups that are empty. Safe to run repeatedly.",
     )
     args = parser.parse_args()
 
@@ -738,7 +988,7 @@ def main() -> None:
         # Keep dependency order even for partial seeds
         groups = [g for g in SEED_ORDER if g in set(selected)]
 
-    asyncio.run(_run(groups, force_wipe=args.wipe))
+    asyncio.run(_run(groups, force_wipe=args.wipe, keep=args.keep))
 
 
 if __name__ == "__main__":

@@ -6,11 +6,16 @@ decisions that stand between those outcomes: which gateway record counts as
 money taken, and how long to wait before calling an order abandoned.
 """
 
+from datetime import UTC, datetime
+
+import pytest
+
 from app.worker.payment_reconciler import (
     ABANDON_H,
     GRACE_S,
     INTERVAL_S,
     _successful_element,
+    _unsettled,
 )
 
 
@@ -131,3 +136,68 @@ def test_orders_are_not_abandoned_the_same_day() -> None:
     overnight, so the threshold stays at least 24 hours.
     """
     assert ABANDON_H >= 24
+
+
+class _CapturingSession:
+    """Records the statement instead of running it. Enough to inspect the WHERE."""
+
+    def __init__(self) -> None:
+        self.statement = None
+
+    async def execute(self, statement):
+        self.statement = statement
+
+        class _Result:
+            def scalars(self_inner):  # noqa: N805 - trivial stub
+                return []
+
+        return _Result()
+
+
+async def _captured_where() -> str:
+    """The WHERE clause as real SQL.
+
+    Compiled with `literal_binds` because SQLAlchemy renders an `IN` as a
+    postcompile placeholder otherwise, and the status values — the thing worth
+    asserting on — would not appear in the string at all.
+    """
+    session = _CapturingSession()
+    await _unsettled(session, datetime.now(UTC))
+    compiled = session.statement.whereclause.compile(
+        compile_kwargs={"literal_binds": True}
+    )
+    return str(compiled).lower()
+
+
+@pytest.mark.asyncio
+async def test_an_unverified_failure_stays_within_the_reconcilers_reach() -> None:
+    """A `failed` order with no gateway payload must still be re-checked.
+
+    `_settle` closes an order straight from the `status` field SSLCommerz POSTs,
+    without validating it. A transaction can carry a declined card followed by a
+    successful wallet, so that unverified `failed` may be describing one attempt
+    of a payment that ultimately succeeded.
+
+    `raw_payload` is written only by `apply_validation`, after a server-to-server
+    check — so NULL means nothing ever confirmed the claim. If this query looked
+    only at `initiated`/`pending`, such an order would leave the reconciler's
+    reach permanently and a real payment could be kept with no ticket issued.
+    """
+    where = await _captured_where()
+
+    assert "raw_payload is null" in where
+    for state in ("failed", "cancelled", "initiated", "pending"):
+        assert state in where, f"{state} orders must be considered"
+
+
+@pytest.mark.asyncio
+async def test_a_confirmed_failure_is_not_re_queried_forever() -> None:
+    """The NULL-payload condition is what stops the query growing without bound.
+
+    Once an outcome has been validated the payload is present, so the order drops
+    out and is never asked about again.
+    """
+    where = await _captured_where()
+
+    # The failed/cancelled branch is gated, not unconditional.
+    assert "raw_payload is null" in where

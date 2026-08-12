@@ -46,6 +46,22 @@ SLICE_SECONDS = 30
 # window — is what stops replay inside it.
 SLICE_TOLERANCE = 1
 
+# Hard ceiling on one code's group size.
+#
+# `passenger_count` is inside the signed payload, and the signing key is the
+# *student's* — `GET /shop/tickets/{id}/qr-material` hands it to their device so
+# codes can be produced with no signal. So the signature proves the count came
+# from the ticket holder; it does not make the count honest. Anyone who reads
+# their own key out of the app can sign whatever number they like.
+#
+# The real bound is the ticket's remaining rides, which only the server and a
+# synced manifest know — see `redeem`. This ceiling is the part that can be
+# enforced from the code alone, so it holds on a helper's phone with no signal
+# too, and it stops the absurd cases (`passenger_count=500`) before any
+# database work happens. Larger than any bus in the fleet on purpose: rejecting
+# a real group is worse than accepting one the ride check will bound anyway.
+MAX_PASSENGERS = 60
+
 _FIELD_SEP = "."
 
 
@@ -134,6 +150,8 @@ def parse_qr(code: str) -> tuple[QrPayload, bytes]:
         # A zero or negative count would let someone board a group while
         # recording nothing against the ticket.
         raise InvalidQr("passenger count must be at least 1")
+    if payload.passenger_count > MAX_PASSENGERS:
+        raise InvalidQr(f"passenger count above the {MAX_PASSENGERS} limit")
 
     return payload, signature
 

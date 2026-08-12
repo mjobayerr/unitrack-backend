@@ -136,6 +136,54 @@ async def get_active_trip(db: AsyncSession, r: Redis, helper_id: uuid.UUID) -> A
     return active
 
 
+# How long after a trip ends its leftover fixes are still accepted.
+#
+# The helper app stops the sensor *before* calling /helper/trips/end, but fixes
+# already sitting in the device's SQLite outbox drain afterwards — a bus that
+# lost signal for most of a route uploads them once it is back, which can be at
+# the depot hours later. Those are genuine fixes belonging to a real trip, so
+# refusing them would throw away the journey.
+#
+# A shift is the right order of magnitude, not minutes. It also makes a 409 from
+# GPS ingest mean one unambiguous thing — "this is not a bus you drove" — which
+# is what lets the client treat it as final and drop the batch instead of
+# retrying a request that can never succeed.
+#
+# Widening this does not widen the live map: late fixes are written to history
+# only, never to `bus:{id}:pos`. The worst a helper can do with it is add fixes
+# to a bus they genuinely drove earlier the same shift.
+GPS_DRAIN_GRACE = datetime.timedelta(hours=12)
+
+
+async def recently_ended_trip(
+    db: AsyncSession,
+    *,
+    helper_id: uuid.UUID,
+    bus_id: uuid.UUID,
+    now: datetime.datetime | None = None,
+) -> Trip | None:
+    """This helper's just-finished trip on this bus, for a draining outbox.
+
+    Scoped to the helper **and** the bus on purpose: it is the reason a fix can
+    be attributed at all once the trip is closed, and widening either half would
+    let a helper post positions for a bus they never drove.
+    """
+    now = now or datetime.datetime.now(datetime.UTC)
+    stmt = (
+        select(Trip)
+        .where(
+            Trip.helper_id == helper_id,
+            Trip.bus_id == bus_id,
+            Trip.status == TripStatus.completed,
+            Trip.actual_end.is_not(None),
+            Trip.actual_end >= now - GPS_DRAIN_GRACE,
+        )
+        .order_by(Trip.actual_end.desc())
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalars().first()
+
+
 async def _live_trip_from_db(db: AsyncSession, helper_id: uuid.UUID) -> Trip | None:
     stmt = select(Trip).where(Trip.helper_id == helper_id, Trip.status == TripStatus.live)
     return (await db.execute(stmt)).scalar_one_or_none()

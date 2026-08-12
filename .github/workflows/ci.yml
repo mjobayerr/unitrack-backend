@@ -1,0 +1,125 @@
+name: CI
+
+# Two jobs, because the test suite is deliberately dependency-free.
+#
+#   check       lint + 161 unit tests. Seconds, no services. Gates everything.
+#   integration migrations, seed and the end-to-end smoke test against real
+#               Postgres, Redis and Elasticsearch.
+#
+# The split matters: `tests/` inspects rules and dependency graphs without a
+# database on purpose, so it stays fast enough to run on every keystroke — but
+# that also means it cannot catch a handler that 500s against real Postgres.
+# Exactly that bug shipped once (`vars()` on a slots dataclass in
+# /helper/trips/active) and only the smoke test found it. Hence job two.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check .
+
+      # No `ruff format --check` step. The project has never run the formatter,
+      # so 22 files would fail it today — adopting it is a one-off reformat and a
+      # style decision, not something CI should start failing on unannounced.
+      # Add the step in the same commit as that reformat.
+
+      - name: Unit tests
+        run: uv run pytest -q
+
+  integration:
+    needs: check
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: unitrack
+          POSTGRES_PASSWORD: unitrack
+          POSTGRES_DB: unitrack
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U unitrack"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          # Runners have limited RAM and ES will happily take all of it.
+          ES_JAVA_OPTS: -Xms512m -Xmx512m
+        ports: ["9200:9200"]
+        options: >-
+          --health-cmd "curl -sf http://localhost:9200/_cluster/health || exit 1"
+          --health-interval 10s --health-timeout 5s --health-retries 18
+
+    env:
+      # Service containers are reachable on localhost from the runner, not by
+      # the Docker-internal names the compose file uses.
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+      ELASTICSEARCH_URL: http://localhost:9200
+      # Test-only. Real deployments read this from .env.prod — see README.
+      JWT_SECRET: ci-only-secret-not-used-anywhere-real
+      ADMIN_EMAIL: admin@ulab.edu.bd
+      # Matches _ADMIN in scripts/seed.py, which the smoke test signs in as.
+      ADMIN_PASSWORD: Admin@1234
+      SERVICE_TIMEZONE: Asia/Dhaka
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - run: uv sync --frozen
+
+      # Proves every migration applies to an empty database in order — the one
+      # thing a hand-written migration can get wrong that no unit test sees.
+      - name: Apply migrations
+        run: uv run alembic upgrade head
+
+      - name: Seed reference data
+        run: uv run python -m scripts.seed users buses stops routes --wipe
+
+      - name: Start the API and worker
+        run: |
+          uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+          uv run python -m app.worker &
+          # The smoke test's Elasticsearch assertions need the worker draining
+          # the stream, so wait for the API rather than sleeping blindly.
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/health && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8000/health
+
+      - name: End-to-end smoke test
+        run: uv run python -m scripts.smoke_test

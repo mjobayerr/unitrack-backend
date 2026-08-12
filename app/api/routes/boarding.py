@@ -49,6 +49,14 @@ logger = logging.getLogger("unitrack.boarding")
 
 router = APIRouter(tags=["boarding"])
 
+# Bounds for one scanned code, applied per item inside the handler rather than by
+# the schema. A genuine code is a uuid, two small integers, a 22-character nonce
+# and an Ed25519 signature — roughly 150 characters. The floor catches a row
+# truncated in the device's outbox; the ceiling catches a helper who scanned an
+# unrelated QR, which can be arbitrarily long.
+CODE_MIN_LEN = 8
+CODE_MAX_LEN = 512
+
 
 # ---------------------------------------------------------------------------
 # Student side
@@ -228,6 +236,16 @@ async def sync_redemptions(
     results: list[RedemptionResultOut] = []
 
     for item in payload.redemptions:
+        # Length is checked here rather than on the schema so that one unusable
+        # code costs one result instead of a 422 for the whole batch. See
+        # RedemptionIn.code — the schema-level bound was a poison pill that
+        # blocked a device's entire outbox indefinitely.
+        if not CODE_MIN_LEN <= len(item.code) <= CODE_MAX_LEN:
+            results.append(
+                RedemptionResultOut(nonce=None, accepted=False, reason="malformed code")
+            )
+            continue
+
         nonce = None
         try:
             nonce = parse_qr(item.code)[0].nonce
