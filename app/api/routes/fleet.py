@@ -4,8 +4,8 @@ Read-only and available to any signed-in account: a helper picks a bus and a
 route here before starting a trip, and the student map needs stop positions and
 route shapes to draw anything.
 
-Admin CRUD for this data is not built yet; seed it with
-`scripts/dev_seed_routes.py`.
+Admin CRUD for stops and routes lives in `app/api/routes/admin_catalog.py`; a
+development corridor can be seeded with `python -m scripts.seed stops routes`.
 """
 
 import uuid
@@ -52,6 +52,56 @@ async def list_routes(
     if only_active:
         stmt = stmt.where(Route.is_active.is_(True))
     return list((await db.execute(stmt.order_by(Route.name, Route.direction))).scalars())
+
+
+@router.get("/route-shapes", response_model=list[RouteDetailOut])
+async def list_route_shapes(
+    db: AsyncSession = Depends(get_db),
+    only_active: bool = Query(default=True),
+) -> list[RouteDetailOut]:
+    """Every route with its ordered stops — one request, everything a map draws.
+
+    Both maps need the same thing on load: the corridor as a line and the stops
+    as points. Doing that through `/fleet/routes` then one `/fleet/routes/{id}`
+    per result is N+1 over HTTP, and on a phone those are N+1 *round trips* on a
+    mobile connection, with the line appearing a direction at a time.
+
+    Not a path segment under `/routes` on purpose: `/fleet/routes/{route_id}` is
+    typed `uuid.UUID`, so a sibling like `/fleet/routes/shapes` would be matched
+    by it first and answered with a 422 about a malformed UUID.
+
+    Deliberately outside the `RouteOut`/`RouteDetailOut` pairing rather than a
+    `?with_stops=` flag on the list endpoint: a query parameter that changes the
+    response *shape* cannot be expressed in one `response_model`, so the
+    generated client would type the stops as always-present or never.
+    """
+    stmt = select(Route).options(selectinload(Route.stops).selectinload(RouteStop.stop))
+    if only_active:
+        stmt = stmt.where(Route.is_active.is_(True))
+    routes = (await db.execute(stmt.order_by(Route.name, Route.direction))).scalars().all()
+
+    return [
+        RouteDetailOut(
+            id=route.id,
+            name=route.name,
+            direction=route.direction,
+            is_active=route.is_active,
+            polyline=route.polyline,
+            # Sorted here rather than trusting insertion order: `seq` is what
+            # defines the shape, and a route whose stops were reordered by the
+            # admin console would otherwise draw a line that zigzags back on
+            # itself — visibly wrong, and only on the routes that were edited.
+            stops=[
+                RouteStopOut(
+                    seq=rs.seq,
+                    scheduled_offset_min=rs.scheduled_offset_min,
+                    stop=StopOut.model_validate(rs.stop),
+                )
+                for rs in sorted(route.stops, key=lambda rs: rs.seq)
+            ],
+        )
+        for route in routes
+    ]
 
 
 @router.get("/routes/{route_id}", response_model=RouteDetailOut)

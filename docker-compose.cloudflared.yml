@@ -1,29 +1,44 @@
-# Production stack with Cloudflare Tunnel — standalone, NOT an override.
+# UniTrack — the whole system, published through a Cloudflare Tunnel.
 #
+#   cp .env.prod.example .env.prod   &&   nano .env.prod
 #   docker compose -f docker-compose.cloudflared.yml --env-file .env.prod up -d --build
 #
-# Topology:
-#   client --HTTPS--> Cloudflare Edge --tunnel--> cloudflared --HTTP--> nginx --HTTP--> api:8000
+# Standalone, not an override of docker-compose.yml. The two files exist for two
+# environments and differ in exactly two ways that matter:
 #
-# Why no exposed ports:
-#   cloudflared creates an outbound connection to Cloudflare; the VPS firewall
-#   never needs 80 or 443 open. Only SSH (22) is needed on the host.
-#   Postgres, Redis, and Elasticsearch are reachable only on the internal network.
+#   1. Nothing here publishes a host port. Not the databases, not the API, not
+#      even nginx — cloudflared dials *out* to Cloudflare, so the VPS firewall
+#      needs only SSH open. A published port here would quietly undo that.
+#   2. Every secret is required rather than defaulted. `${X:?}` fails the `up`
+#      instead of booting with a development password.
 #
-# Pre-flight checklist on the VPS:
-#   1. vm.max_map_count=262144
+# Topology
+# --------
+#   api.kodewithmj.xyz      --tunnel--> cloudflared --> nginx:80    --> api:8000
+#   adm.kodewithmj.xyz      --tunnel--> cloudflared --> admin:3000  --> api:8000
+#   unitrack.kodewithmj.xyz --tunnel--> cloudflared --> student:3001 --> api:8000
+#
+# One tunnel, three public hostnames. The hostname-to-service mapping lives in
+# the Cloudflare dashboard, not in this file.
+#
+# Pre-flight on the VPS
+# ---------------------
+#   1. vm.max_map_count — Elasticsearch refuses to boot without it:
 #        echo 'vm.max_map_count=262144' >> /etc/sysctl.conf && sysctl -p
-#   2. Firewall: only SSH open
+#   2. Firewall, SSH only:
 #        ufw allow 22/tcp && ufw enable
-#   3. .env.prod filled from .env.prod.example with all CHANGE_ME values replaced
-#   4. Cloudflare Zero Trust → Networks → Tunnels → Create a tunnel
+#   3. .env.prod filled in, every CHANGE_ME replaced.
+#   4. Cloudflare Zero Trust > Networks > Tunnels > Create a tunnel
 #        - Connector type: Docker
-#        - Public Hostname: api.kodewithmj.xyz  →  Service: http://nginx:80
-#        - Copy the tunnel token into .env.prod as CLOUDFLARE_TUNNEL_TOKEN
-#   5. Cloudflare dashboard → SSL/TLS → set to "Full" (origin is HTTP-only inside Docker)
+#        - Public hostnames, all three, pointing at the services above
+#        - Paste the token into .env.prod as CLOUDFLARE_TUNNEL_TOKEN
+#   5. Cloudflare dashboard > SSL/TLS > Full. The origin is plain HTTP inside
+#      Docker; "Full (strict)" would demand a cert nginx is not serving.
 #
-# Scaling note: increase api replicas and add `--workers N` to the uvicorn CMD
-# in Dockerfile to use multiple CPU cores on a bigger VPS.
+# Scaling: raise the api replica count and add `--workers N` to the uvicorn CMD
+# in the Dockerfile once the box has cores to spend.
+
+name: unitrack
 
 services:
   postgres:
@@ -43,6 +58,8 @@ services:
 
   redis:
     image: redis:7
+    # requirepass turns auth on. The API reads the same value from
+    # REDIS_PASSWORD, so there is never a window where Redis is open.
     command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set in .env.prod}"]
     volumes:
       - redis-data:/data
@@ -64,10 +81,25 @@ services:
       - es-data:/usr/share/elasticsearch/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf -u elastic:${ELASTICSEARCH_PASSWORD} http://localhost:9200/_cluster/health || exit 1"]
+      test:
+        - CMD-SHELL
+        - curl -sf -u elastic:${ELASTICSEARCH_PASSWORD} http://localhost:9200/_cluster/health || exit 1
       interval: 10s
       timeout: 5s
       retries: 12
+
+  # Migrations only. No seed data on a production box: the seeder creates
+  # accounts with published passwords, which on a public host is a back door.
+  # Create the first admin with `scripts.seed_admin` (see README).
+  init:
+    build: .
+    env_file: .env.prod
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      elasticsearch: {condition: service_healthy}
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
 
   api:
     build: .
@@ -76,8 +108,16 @@ services:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
       elasticsearch: {condition: service_healthy}
+      init: {condition: service_completed_successfully}
     restart: unless-stopped
-    # No host port: nginx is the only path in.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health',timeout=3).status==200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
 
   worker:
     build: .
@@ -87,27 +127,58 @@ services:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
       elasticsearch: {condition: service_healthy}
+      init: {condition: service_completed_successfully}
     restart: unless-stopped
 
   nginx:
     image: nginx:1.27
     depends_on:
-      - api
-    # No host ports — cloudflared reaches nginx by Docker DNS name ("nginx:80").
+      api: {condition: service_healthy}
+    # No host ports — cloudflared reaches it by Docker DNS name, "nginx:80".
     volumes:
       - ./deploy/nginx.cloudflared.conf:/etc/nginx/conf.d/default.conf:ro
     restart: unless-stopped
 
+  admin:
+    build:
+      context: ../unitrack-web
+      args:
+        APP: admin
+    environment:
+      # Straight to the API, deliberately bypassing nginx: its rate limiter keys
+      # on the client IP, which for these server-side calls is this one
+      # container. Every operator would share a single 120 r/m bucket.
+      UNITRACK_API_URL: http://api:8000
+      PORT: "3000"
+    depends_on:
+      api: {condition: service_healthy}
+    restart: unless-stopped
+
+  student:
+    build:
+      context: ../unitrack-web
+      args:
+        APP: student
+    environment:
+      UNITRACK_API_URL: http://api:8000
+      PORT: "3001"
+    depends_on:
+      api: {condition: service_healthy}
+    restart: unless-stopped
+
   cloudflared:
     image: cloudflare/cloudflared:latest
-    restart: unless-stopped
-    # --no-autoupdate keeps the container image version stable; upgrade by
-    # pulling a new image tag and re-deploying, not by in-place auto-update.
+    # --no-autoupdate keeps the running version equal to the image tag. An
+    # in-place self-update means the connector that worked yesterday is not the
+    # binary running today, which is the wrong surprise during an incident.
     command: tunnel --no-autoupdate run
     environment:
       TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?get from Cloudflare Zero Trust > Tunnels}
     depends_on:
       - nginx
+      - admin
+      - student
+    restart: unless-stopped
 
 volumes:
   postgres-data:

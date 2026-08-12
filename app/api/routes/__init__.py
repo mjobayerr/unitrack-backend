@@ -15,7 +15,18 @@ is a build failure rather than a code-review hope.
 
 from fastapi import APIRouter
 
-from app.api.routes import admin, auth, bus_track, fleet, helper, tracking
+from app.api.routes import (
+    admin,
+    admin_catalog,
+    auth,
+    boarding,
+    bus_track,
+    fleet,
+    helper,
+    shop,
+    tracking,
+    wallet_page,
+)
 
 # Every router in the API. `api_router` is built from this tuple rather than
 # from a list of include_router() calls, so the auth-coverage test and the
@@ -23,10 +34,14 @@ from app.api.routes import admin, auth, bus_track, fleet, helper, tracking
 ROUTERS: tuple[APIRouter, ...] = (
     auth.router,
     admin.router,
+    admin_catalog.router,
     bus_track.router,
     fleet.router,
     helper.router,
     tracking.router,
+    shop.router,
+    boarding.router,
+    wallet_page.router,
 )
 
 api_router = APIRouter()
@@ -41,9 +56,26 @@ PUBLIC_PATHS: frozenset[str] = frozenset(
         "/auth/register/student",  # no account exists yet
         "/auth/register/helper",  # no account exists yet
         "/auth/verify-email",  # the token in the emailed link IS the credential
+        # A student who never received the first email cannot log in to ask for
+        # another — that is the entire problem it solves. Answers 202 whatever
+        # the address is, so it reveals nothing.
+        "/auth/resend-verification",
         "/auth/login",  # issues the credential
         "/auth/refresh",  # the refresh token IS the credential
         "/bus-track",  # public read-only bus location lookup for clients
+        # The payment gateway redirects the student's browser here with a
+        # form POST that carries no credential of ours. Authenticating it is
+        # impossible; instead nothing in the request is trusted, and the
+        # payment is confirmed by a server-to-server validation call before
+        # any ticket is issued. See app/api/routes/shop.py.
+        "/shop/payments/return",
+        # SSLCommerz posts here server-to-server, so there is no session to
+        # authenticate at all. Same defence as the return: the request is a
+        # lookup key, and the payment is confirmed by calling the gateway back.
+        "/shop/payments/ipn",
+        # The student wallet page. Public like any single-page app: it ships no
+        # data, and authenticates from inside against /auth/login.
+        "/wallet",
         # FastAPI's own docs endpoints.
         "/docs",
         "/docs/oauth2-redirect",

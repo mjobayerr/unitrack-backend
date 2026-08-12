@@ -29,8 +29,9 @@ No IoT hardware on buses. The **helper's smartphone is the only sensor** (GPS, Q
 
 ## Status at a glance
 
-**Functional now** — built, and verified end-to-end against real Postgres +
-Redis + Elasticsearch by [`scripts/smoke_test.py`](scripts/smoke_test.py) (36 checks):
+**Functional now** — 161 unit tests, plus 37 end-to-end checks against real
+Postgres + Redis + Elasticsearch ([`scripts/smoke_test.py`](scripts/smoke_test.py)).
+Both run in CI on every push ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
 
 | Area | State |
 |---|---|
@@ -42,22 +43,29 @@ Redis + Elasticsearch by [`scripts/smoke_test.py`](scripts/smoke_test.py) (36 ch
 | GPS pipeline: ingest → Redis → worker → Elasticsearch → `/track/nearby` | ✅ |
 | Seat reports + latest-state cache | ✅ |
 | Alerts / SOS + admin console (list / acknowledge / resolve) | ✅ |
+| Token revocation, refresh rotation, `/auth/logout` | ✅ |
+| Commerce: products, orders, SSLCommerz payment, ticket issuance | ✅ |
+| Payment reconciler — settles orders no report ever arrived for (spec §9) | ✅ |
+| Boarding QR: Ed25519 rotating codes, manifest, redemption sync (spec §7.2/§7.5) | ✅ |
+| Cross-device fraud sweep — suspends reused codes, raises an alert | ✅ |
+| **ETA engine** — rolling observed speed near stops, schedule further out (spec §7.4) | ✅ |
+| **Admin catalog CRUD** — products, stops, routes (no psql needed) | ✅ |
+| **Email/SMTP** — student verification actually sends | ✅ |
+| **Live fleet map** — `GET /admin/fleet`, positions from Redis + GPS-freshness (spec §10.2) | ✅ |
 
 **Not built yet** — in the spec, not started (roadmap order):
 
 | Area | Notes |
 |---|---|
-| Tickets, wallet, bKash purchase | Blocked on bKash credentials. Payment is the gate; the QR/ride model is designed (spec §7.2/§7.5) |
-| Offline QR validation + fraud sweep | Depends on tickets |
-| Live-tracking WebSocket `/ws/track/{route_id}` | nginx already carries the upgrade headers |
-| ETA engine | Free path (route-offset + rolling speed) if no Mapbox key |
+| Live-tracking WebSocket `/ws/track/{route_id}` | nginx already carries the upgrade headers; clients poll for now |
 | Materialized report tables + admin dashboards | Spec §10 |
-| Email/SMTP (verification is logged to stdout for now) | Later phase |
+| `audit_logs` | Spec §6. Admin actions record `approved_by` / `acknowledged_by` on the row itself; there is no separate trail |
 
 Sibling clients: **[unitrack-helper](https://github.com/mjobayerr/unitrack-helper)**
-(Flutter, functional) · **[unitrack-web](https://github.com/mjobayerr/unitrack-web)**
-(Next.js, not started — so **admin approval currently has no UI**; approve via
-`/docs`, `POST /admin/helpers/{id}/approve`, or the dev seed script).
+(Flutter — GPS tracking and the offline boarding scanner; APKs build in CI) ·
+**[unitrack-web](https://github.com/mjobayerr/unitrack-web)** (Next.js — admin
+console for helper approval and alerts, student app for wallet, checkout and the
+live map).
 
 ---
 
@@ -213,10 +221,47 @@ curl "localhost:8000/track/nearby?lat=23.78&lng=90.40&radius_km=5"
 | POST | `/helper/gps` | Ingest a batch of fixes (approved helper only). |
 | POST | `/helper/seats` | Report occupancy for the live trip. |
 | POST | `/helper/alerts` | Raise an alert (SOS / breakdown / …); severity set server-side. |
+| GET | `/admin/fleet` | Every live trip: position, freshness, seats, next stop. **admin** |
 | GET | `/admin/alerts` | Open alerts, worst first. **admin** |
 | POST | `/admin/alerts/{id}/acknowledge` | Claim an alert. **admin** |
 | POST | `/admin/alerts/{id}/resolve` | Close an alert with a note. **admin** |
 | GET | `/track/nearby` | Buses within `radius_km`, closest first (ES `geo_distance`). |
+| GET | `/shop/products` | Ticket catalogue. |
+| POST | `/shop/orders` | Start a purchase; returns the gateway checkout URL. Idempotent. **student** |
+| GET | `/shop/orders` | The caller's own orders. **student** |
+| POST | `/shop/payments/return` | Where the gateway sends the browser back. Public by necessity. |
+| POST | `/shop/payments/ipn` | Where the gateway reports server-to-server. Public by necessity. |
+| GET | `/shop/tickets` | The caller's wallet. **student** |
+
+### Payments (SSLCommerz)
+
+**Deviation from the spec.** §7.1 and §9 were written around bKash PGW
+(Grant Token → Create Payment → Execute → Query). The integration is
+**SSLCommerz**, an aggregator that offers bKash alongside cards and other
+wallets, and its flow is different: session init returns a `GatewayPageURL`,
+the student pays there, and the outcome is confirmed by validating a `val_id`
+server-to-server. Order columns are therefore named `gateway_*` rather than
+`bkash_*` — the provider has already changed once.
+
+**Nothing the browser says is trusted.** The student returns via a redirect
+carrying a `val_id`, but that is an ordinary HTTP request anyone can forge by
+typing a URL. A ticket is issued only after a direct call to SSLCommerz
+confirms three things: the status is `VALID`/`VALIDATED`, the settled amount
+**and** currency equal the order's own, and the transaction is not risk-flagged.
+Checking only the status would sell a 100 BDT ticket for 1 BDT.
+
+Two reports of the same payment arrive — the browser return and the IPN — and
+both run the same settlement path so they cannot disagree. Whichever lands
+first settles the order; the other finds it `paid` and stops. A unique
+`tickets.order_id` catches the race if they slip past that check.
+
+Money is stored in **paisa as an integer**, never a float.
+
+`SSLCOMMERZ_STORE_ID` / `SSLCOMMERZ_STORE_PASSWORD` come from the merchant
+panel. For a sandbox store the API password is usually `<store_id>@ssl`, which
+is **not** the password shown in the panel's store-detail view. `ipn_url` is
+only registered when `PUBLIC_BASE_URL` is publicly resolvable, so on localhost
+settlement is redirect-only.
 
 Full contract: `GET /openapi.json` (clients generate types from it). All 20
 endpoints are exercised end-to-end by [`scripts/smoke_test.py`](scripts/smoke_test.py).
@@ -296,18 +341,20 @@ Then point the app's release build at it:
 | Cloudflare **Full (Strict)**, never Flexible | Flexible leaves Cloudflare→origin in cleartext |
 | `ufw` to 22 + 443 only | Defense in depth behind the port choices |
 
-Not yet hardened (documented, follow-up): Elasticsearch auth (kept internal-only
-for now), ES replica + snapshot policy, rate limiting on `/auth/login`, and
-refresh-token rotation/revocation (see [`docs/auth.md`](docs/auth.md) "Known gaps").
+Since hardened: Elasticsearch runs with `xpack.security` and the app
+authenticates; `/auth/login` and `/auth/register` are rate limited in nginx
+(5r/m, against the real client IP behind Cloudflare); refresh tokens rotate and
+every token carries a revocable `jti`.
+
+Still open: an ES replica + snapshot policy — single-node ES is not durable.
 
 ## What's next
 
-- **Helper app trip UI**: login + refresh, bus/route pickers, Start/Stop bound to the trip endpoints. Then GPS-without-a-trip becomes a 409.
-- **Live tracking WebSocket**: `/ws/track/{route_id}` fan-out of position + ETA + seats (spec §7.3 step 4).
-- **Admin CRUD** for stops/routes/buses — seeded by `scripts/dev_seed_routes.py` today.
-- **ETA engine**: Mapbox `driving-traffic` worker job (spec §7.4).
-- **Tickets & offline QR** (spec §7.2/§7.5), **bKash** (§9), **fraud sweep**, **reports** (§10).
-- **ES hardening**: single-node ES is not durable — add a replica + snapshot policy before production; report/fraud jobs must query ES, not Postgres joins.
+- **Live tracking WebSocket**: `/ws/track/{route_id}` fan-out of position + ETA + seats (spec §7.3 step 4). Clients poll today, which works but costs a request per tick.
+- **`audit_logs`** (spec §6): who did what, as a trail rather than a column on the affected row.
+- **Reports** (§10) — `orders` and `tickets` now exist to aggregate.
+- **ES hardening**: single-node ES is not durable — add a replica + snapshot policy before production; report/fraud jobs must query ES, not Postgres joins. Elasticsearch also still runs with `xpack.security` off, kept off the public network rather than authenticated.
+- **Refresh-token reuse detection**: rotation and revocation are in place; detecting a *replayed* old refresh token and killing the whole family is the next step.
 
 Build order: **P1 money & identity → P2 live ops → P3 validation & ETA → P4 reports & polish**.
 

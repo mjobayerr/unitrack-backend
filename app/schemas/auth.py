@@ -59,3 +59,46 @@ class UserOut(BaseModel):
     name: str
     role: UserRole
     status: UserStatus
+
+
+class StudentProfileOut(BaseModel):
+    """The student-specific half of a profile, collected at registration.
+
+    Only present for student accounts; a helper or admin has no such row.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    student_id_no: str
+    department: str | None = None
+    batch: str | None = None
+
+
+class MeOut(BaseModel):
+    """The signed-in account, with everything registration captured.
+
+    A superset of `UserOut` — it adds `phone` and, for students, the nested
+    profile — so any client reading the old fields is unaffected. `student` is
+    null for non-students rather than the fields being absent, which keeps the
+    shape stable regardless of role.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    email: EmailStr
+    name: str
+    role: UserRole
+    status: UserStatus
+    phone: str | None = None
+    student: StudentProfileOut | None = None
+
+
+class ResendVerification(BaseModel):
+    """Ask for the confirmation link again.
+
+    Only an address. The account cannot be logged into yet — that is the whole
+    problem it solves — so there is no session to authenticate this with.
+    """
+
+    email: EmailStr
