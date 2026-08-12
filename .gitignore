@@ -31,3 +31,4 @@ redis-data/
 .DS_Store
 .idea/
 .vscode/
+pyrightconfig.json
