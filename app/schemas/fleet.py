@@ -16,10 +16,27 @@ class BusOut(BaseModel):
 
 
 class BusCreate(BaseModel):
-    reg_no: str
-    nickname: str | None = None
-    capacity: int = 40
+    # Bounded because these were open: an empty `reg_no` produced a nameless bus
+    # in the helper's picker, and `capacity: 0` made every seat report read as
+    # over capacity, so the student app showed a full bus forever.
+    reg_no: str = Field(min_length=1, max_length=32)
+    nickname: str | None = Field(default=None, max_length=64)
+    capacity: int = Field(default=40, ge=1, le=200)
     status: BusStatus = BusStatus.active
+
+
+class BusUpdate(BaseModel):
+    """A partial edit. Unset fields are left alone.
+
+    `status: inactive` is how a bus is removed and `maintenance` is the temporary
+    version — `trips` reference buses with RESTRICT, so a DELETE would either
+    fail or take a journey's history with it.
+    """
+
+    reg_no: str | None = Field(default=None, min_length=1, max_length=32)
+    nickname: str | None = Field(default=None, max_length=64)
+    capacity: int | None = Field(default=None, ge=1, le=200)
+    status: BusStatus | None = None
 
 
 class BusListCreate(BaseModel):

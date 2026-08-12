@@ -93,6 +93,24 @@ def parse_seats(raw: dict[str, str] | None) -> tuple[int | None, int | None]:
         return None, None
 
 
+def minutes_until(eta: datetime, now: datetime) -> int:
+    """Whole minutes from `now` to `eta`, floored at zero.
+
+    Every read path recomputes this rather than serving the `eta_minutes` the ETA
+    engine wrote, because the engine runs once a minute and its payload outlives
+    that run. Served verbatim, a bus reads "2 min away" for as long as the cache
+    holds — including after it has already been and gone. The absolute `eta` is
+    the only durable fact in the payload.
+
+    Still rounded server-side, which is the reason `eta_minutes` exists: derive
+    it in the browser and two phones with slightly different clocks show
+    different numbers for the same bus.
+    """
+    if eta.tzinfo is None:
+        eta = eta.replace(tzinfo=UTC)
+    return max(round((eta - now).total_seconds() / 60), 0)
+
+
 def next_stop_minutes(raw: str | None, now: datetime) -> int | None:
     """Minutes to the next stop, from the ETA engine's cached payload.
 
@@ -113,7 +131,7 @@ def next_stop_minutes(raw: str | None, now: datetime) -> int | None:
         eta = datetime.fromisoformat(arrivals[0]["eta"])
     except (KeyError, ValueError, TypeError):
         return None
-    return max(round((eta - now).total_seconds() / 60), 0)
+    return minutes_until(eta, now)
 
 
 def age_seconds(fix_ts: datetime | None, now: datetime) -> int | None:

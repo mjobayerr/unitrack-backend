@@ -168,9 +168,22 @@ class ManifestTicketOut(BaseModel):
 
 
 class RedemptionIn(BaseModel):
-    """One boarding a helper's device recorded, online or hours earlier."""
+    """One boarding a helper's device recorded, online or hours earlier.
 
-    code: str = Field(min_length=8, max_length=512)
+    `code` carries **no length constraint on purpose**, and removing the one it
+    used to have was a bug fix. Pydantic validates the whole body or none of it,
+    so a single unusable code — a row truncated in the device's SQLite outbox, or
+    a helper who scanned an unrelated poster QR — made the request 422 and took
+    every genuine boarding in the batch down with it. The device only drops a row
+    when it gets a per-item answer, so it never dropped the bad one: it resent
+    the same batch forever and no boarding behind it ever synced.
+
+    The endpoint's contract is one answer per item (see `sync_redemptions`), and
+    that can only hold if the length check happens there, per code, rather than
+    here for the batch. `CODE_MAX_LEN` is where it moved to.
+    """
+
+    code: str
     device_id: str = Field(min_length=1, max_length=128)
     # The device's own clock at the scan. Not trusted for validity — the time
     # slice inside the signed code decides that — but recorded so an offline

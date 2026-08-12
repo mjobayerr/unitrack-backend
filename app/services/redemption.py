@@ -68,6 +68,42 @@ def _check_valid_window(ticket: Ticket, now: datetime) -> None:
         raise RedemptionRejected("ticket not yet valid")
 
 
+def _check_rides_cover_group(ticket: Ticket, passenger_count: int) -> None:
+    """The group must fit inside what is left on the ticket.
+
+    This is the check that makes a ticket cost what it claims to, and it was
+    missing.
+
+    `passenger_count` lives inside the signed payload, and the signing key
+    belongs to the **student** — `GET /shop/tickets/{id}/qr-material` hands it to
+    their own device so codes can be produced with no signal. So the signature
+    proves the count came from the ticket holder and nothing more; anyone who
+    reads their own key out of the app can sign any number they like.
+
+    Without this bound, a 10-ride ticket signed with `passenger_count=40` boarded
+    forty people. The deduction in `redeem` clamps at zero, so the ticket
+    recorded ten rides and thirty fares were simply never paid. Confirmed against
+    the running stack before the fix, and it came back `accepted=True, flag=ok`
+    — not even raised for review.
+
+    Only checked for a **first sighting**, like the empty-ticket rule above and
+    for the same reason: a duplicate must still be recorded so the fraud sweep
+    has the evidence.
+
+    `rides_remaining` is None for an unlimited pass, so this is not a truthiness
+    check — `0` and `None` mean opposite things. An unlimited pass is bounded by
+    `MAX_PASSENGERS` in `verify_qr` instead, since there is no ride count to
+    measure a group against.
+    """
+    if ticket.rides_remaining is None:
+        return
+    if passenger_count > ticket.rides_remaining:
+        raise RedemptionRejected(
+            f"{passenger_count} passengers but "
+            f"{ticket.rides_remaining} ride(s) left on this ticket"
+        )
+
+
 async def redeem(
     db: AsyncSession,
     *,
@@ -126,6 +162,7 @@ async def redeem(
         # truthiness check: `0` and `None` mean opposite things.
         if ticket.rides_remaining is not None and ticket.rides_remaining <= 0:
             raise RedemptionRejected("no rides remaining")
+        _check_rides_cover_group(ticket, payload.passenger_count)
     else:
         logger.warning(
             "nonce %s already redeemed on device %s, now presented by %s — flagging",

@@ -22,6 +22,15 @@ class HelperOut(BaseModel):
     approved_by: uuid.UUID | None
 
 
+class UserStatusOut(BaseModel):
+    """The result of a moderation action, so the console can redraw without a
+    second round trip — and so a caller can see the helper row moved too."""
+
+    user_id: uuid.UUID
+    user_status: UserStatus
+    helper_status: HelperStatus | None = None
+
+
 class GpsFreshness(enum.StrEnum):
     """How much to trust a bus's position (spec §10.2).
 

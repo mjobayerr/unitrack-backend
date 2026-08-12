@@ -5,6 +5,7 @@ Helpers self-register as pending, so without the approval check anyone who
 completed signup could start trips and inject positions for any bus.
 """
 
+import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -187,18 +188,29 @@ async def ingest_gps(
     fix to the `gps_ingest` stream. The worker drains that stream into
     Elasticsearch.
 
-    Trip binding
-    ------------
-    If the helper has a live trip, its id rides along on every fix and the
-    trip's bus wins over whatever the client sent — the server decides which bus
-    a helper is driving, not the phone.
+    Trip binding — and why a trip is now required
+    ---------------------------------------------
+    Every fix must belong to a trip this helper actually drove. A live trip binds
+    the batch and **the trip's bus wins over whatever the client sent** — the
+    server decides which bus a helper is driving, not the phone.
 
-    Fixes with no live trip are still accepted, with an empty `trip_id`. That is
-    a **transition allowance** for the current helper build, which has no trip
-    UI yet; it is why `trip_id` is nullable downstream. Once the app ships trip
-    lifecycle, make this a 409 and delete this paragraph.
+    This used to accept fixes with no trip at all, as a transition allowance for
+    a helper build that had no trip UI. That build shipped, and the allowance was
+    a hole: any approved helper could put any bus anywhere on the live map and in
+    the fix history, for a bus they had never been near, just by naming its id.
+
+    The one case that is not spoofing is a **draining outbox**. The app stops the
+    sensor before ending a trip, but fixes already queued on the device upload
+    afterwards, and those belong to a real journey. So a batch with no live trip
+    is matched against this helper's just-ended trip *on that same bus*
+    (`recently_ended_trip`); anything else is a 409.
+
+    Late fixes are written to history but **not** to `bus:{id}:pos`, and nothing
+    is published to the fleet channel for them. Their trip is over; refreshing
+    the live position would put a finished bus back on the console's map.
     """
     active = await trip_service.get_active_trip(db, r, helper.helper_id)
+    live = active is not None
 
     if active is not None:
         if batch.bus_id != active.bus_id:
@@ -209,12 +221,22 @@ async def ingest_gps(
         bus_id = str(active.bus_id)
         trip_id = str(active.trip_id)
     else:
-        # No trip: the bus is unverified beyond "it exists", so this costs a
-        # query. The trip path above skips it — the trip already proved the bus.
-        if await db.get(Bus, batch.bus_id) is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown bus")
-        bus_id = str(batch.bus_id)
-        trip_id = ""
+        late = await trip_service.recently_ended_trip(
+            db, helper_id=helper.helper_id, bus_id=batch.bus_id
+        )
+        if late is None:
+            # 404 for a bus that does not exist, 409 for one that does but is not
+            # this helper's to report on. Telling them apart is not a leak — a
+            # helper can already list the fleet — and "unknown bus" sent someone
+            # hunting for a data problem that was not there.
+            if await db.get(Bus, batch.bus_id) is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown bus")
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "No live trip on this bus — start a trip before sending positions",
+            )
+        bus_id = str(late.bus_id)
+        trip_id = str(late.id)
 
     newest = max(batch.points, key=lambda p: p.ts)
     pos_key = bus_pos_key(bus_id)
@@ -223,20 +245,21 @@ async def ingest_gps(
     # fixes that is 52 network waits collapsed into one, on the endpoint every
     # bus hits every 5 seconds.
     pipe = r.pipeline(transaction=False)
-    pipe.hset(
-        pos_key,
-        mapping={
-            "lat": str(newest.lat),
-            "lng": str(newest.lng),
-            "speed": str(newest.speed) if newest.speed is not None else "",
-            "heading": str(newest.heading) if newest.heading is not None else "",
-            "ts": newest.ts.astimezone(UTC).isoformat(),
-            "trip_id": trip_id,
-            "ingested_at": datetime.now(UTC).isoformat(),
-        },
-    )
-    pipe.expire(pos_key, 60)
-    pipe.publish(fleet_channel(), f"{bus_id}:{newest.lat},{newest.lng}")
+    if live:
+        pipe.hset(
+            pos_key,
+            mapping={
+                "lat": str(newest.lat),
+                "lng": str(newest.lng),
+                "speed": str(newest.speed) if newest.speed is not None else "",
+                "heading": str(newest.heading) if newest.heading is not None else "",
+                "ts": newest.ts.astimezone(UTC).isoformat(),
+                "trip_id": trip_id,
+                "ingested_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        pipe.expire(pos_key, 60)
+        pipe.publish(fleet_channel(), f"{bus_id}:{newest.lat},{newest.lng}")
     for p in batch.points:
         pipe.xadd(
             GPS_STREAM,
@@ -254,8 +277,11 @@ async def ingest_gps(
         )
     await pipe.execute()
 
+    # Echo the trip the fixes were actually filed under — the live one, or the
+    # just-ended one a draining outbox belongs to. `trip_id` is never empty now,
+    # so a client that sees null here is talking to an older build.
     return GpsAccepted(
         accepted=len(batch.points),
-        bus_id=batch.bus_id if active is None else active.bus_id,
-        trip_id=active.trip_id if active else None,
+        bus_id=uuid.UUID(bus_id),
+        trip_id=uuid.UUID(trip_id),
     )

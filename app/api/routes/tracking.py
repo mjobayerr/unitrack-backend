@@ -27,6 +27,7 @@ from app.core.redis import get_redis, trip_eta_key
 from app.db.session import get_db
 from app.models.fleet import Route, RouteStop, Stop, Trip, TripStatus
 from app.schemas.trip import BusArrivalOut, StopArrivalsOut, TripEtaOut
+from app.services.fleet_view import minutes_until
 
 # Any signed-in, active account may look up buses — students, helpers, admins
 # all need it. Not public: live vehicle positions are the fleet's whereabouts,
@@ -171,7 +172,22 @@ async def trip_eta(
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, "No arrival estimate for this trip yet"
         )
-    return TripEtaOut.model_validate(cached)
+    out = TripEtaOut.model_validate(cached)
+    return _restate_minutes(out, datetime.now(UTC))
+
+
+def _restate_minutes(out: TripEtaOut, now: datetime) -> TripEtaOut:
+    """Recount every arrival's minutes against the clock now.
+
+    The ETA engine runs once a minute and its payload is cached for longer, so
+    the `eta_minutes` it wrote is stale by up to a minute in the good case and
+    indefinitely if the engine stops. Served as-is, a bus reads "2 min away" for
+    as long as the cache holds — including well after it has come and gone. The
+    absolute `eta` is the durable fact, so the minutes are derived from it here.
+    """
+    for arrival in out.arrivals:
+        arrival.eta_minutes = minutes_until(arrival.eta, now)
+    return out
 
 
 @router.get("/stops/{stop_id}/arrivals", response_model=StopArrivalsOut)
@@ -195,6 +211,8 @@ async def stop_arrivals(
     if stop is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown stop")
 
+    now = datetime.now(UTC)
+
     # Live trips whose route includes this stop. A trip on a route that does not
     # serve it can never arrive, so there is no point reading its estimate.
     stmt = (
@@ -213,12 +231,17 @@ async def stop_arrivals(
         for item in cached.get("arrivals", []):
             if item.get("stop_id") != str(stop_id):
                 continue
+            eta = datetime.fromisoformat(item["eta"])
             arrivals.append(
                 BusArrivalOut(
                     stop_id=stop_id,
                     seq=item["seq"],
-                    eta=item["eta"],
-                    eta_minutes=item["eta_minutes"],
+                    eta=eta,
+                    # Recounted, not read from the payload — see `_restate_minutes`.
+                    # This is the endpoint a student reads while deciding whether
+                    # to run for a bus, so a minute-old number is the wrong answer
+                    # to the question they asked.
+                    eta_minutes=minutes_until(eta, now),
                     basis=item["basis"],
                     distance_km=item["distance_km"],
                     trip_id=trip_id,
@@ -235,6 +258,6 @@ async def stop_arrivals(
     return StopArrivalsOut(
         stop_id=stop.id,
         stop_name=stop.name,
-        as_of=datetime.now(UTC),
+        as_of=now,
         arrivals=arrivals[:limit],
     )

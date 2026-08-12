@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from redis.asyncio import Redis
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_admin
@@ -32,11 +33,17 @@ from app.core.redis import (
     trip_eta_key,
 )
 from app.db.session import get_db
-from app.models.fleet import Bus, Route, Trip, TripStatus
+from app.models.fleet import Bus, BusStatus, Route, Trip, TripStatus
 from app.models.ops import Alert, AlertStatus
 from app.models.user import Helper, HelperStatus, User, UserStatus
-from app.schemas.admin import FleetBusOut, FleetOut, GpsFreshness, HelperOut
-from app.schemas.fleet import BusCreate, BusListCreate, BusOut
+from app.schemas.admin import (
+    FleetBusOut,
+    FleetOut,
+    GpsFreshness,
+    HelperOut,
+    UserStatusOut,
+)
+from app.schemas.fleet import BusCreate, BusListCreate, BusOut, BusUpdate
 from app.schemas.ops import AlertOut, AlertResolveIn
 from app.services.fleet_view import (
     age_seconds,
@@ -184,6 +191,54 @@ async def suspend_user(
     await db.commit()
 
     await invalidate_principal(r, user_id)
+
+
+@router.post("/users/{user_id}/reinstate", response_model=UserStatusOut)
+async def reinstate_user(
+    user_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    r: Redis = Depends(get_redis),
+) -> UserStatusOut:
+    """Undo a suspension.
+
+    There was no way back. Suspension is one click and mistakes are ordinary —
+    a name confused for another, a complaint that turned out to be nothing — and
+    until this existed the only remedy was an UPDATE in psql on the production
+    database. A moderation action with no inverse is not a moderation action.
+
+    A helper is returned to `approved`, not to `pending`: they were approved once
+    and re-queueing them would lose that. `approved_by` still names the admin who
+    made the original decision, which is the audit trail worth keeping.
+
+    Only reverses a suspension. An account waiting on its email confirmation or
+    on a first approval is not something to skip past — the answer says which.
+    """
+    user = await db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown user")
+    if user.status is not UserStatus.suspended:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"Account is {user.status.value}, not suspended"
+        )
+
+    user.status = UserStatus.active
+    helper = (
+        await db.execute(select(Helper).where(Helper.user_id == user_id))
+    ).scalar_one_or_none()
+    if helper is not None:
+        helper.status = HelperStatus.approved
+    await db.commit()
+
+    # RULE 3 again, in the direction that costs the user rather than the system:
+    # without this the reinstated account keeps reading `suspended` and stays
+    # locked out for up to PRINCIPAL_TTL_S with no way to tell why.
+    await invalidate_principal(r, user_id)
+
+    return UserStatusOut(
+        user_id=user.id,
+        user_status=user.status,
+        helper_status=helper.status if helper else None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +441,71 @@ async def create_bus(
         status=body.status,
     )
     db.add(bus)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        # The check above is check-then-insert; the unique on reg_no is the
+        # authority. Two operators adding the same bus is a 409, not a 500.
+        await db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=f"Bus with reg_no '{body.reg_no}' already exists",
+        ) from exc
+    return bus
+
+
+@router.get("/buses", response_model=list[BusOut])
+async def list_fleet_buses(
+    db: AsyncSession = Depends(get_db),
+    bus_status: BusStatus | None = Query(
+        default=None, description="Filter by state; omit for the whole fleet."
+    ),
+) -> list[Bus]:
+    """The whole fleet, retired and in-maintenance buses included.
+
+    `GET /fleet/buses` exists but defaults to active only — it is the helper's
+    bus picker, and a helper must not be offered a bus that is off the road. An
+    operator needs the opposite: the bus in the workshop is exactly the one they
+    are looking for.
+    """
+    stmt = select(Bus)
+    if bus_status is not None:
+        stmt = stmt.where(Bus.status == bus_status)
+    return list((await db.execute(stmt.order_by(Bus.reg_no))).scalars())
+
+
+@router.patch("/buses/{bus_id}", response_model=BusOut)
+async def update_bus(
+    bus_id: uuid.UUID,
+    body: BusUpdate,
+    db: AsyncSession = Depends(get_db),
+) -> Bus:
+    """Edit a bus — recapacity it, rename it, or take it off the road.
+
+    There is no DELETE, for the same reason routes and products have none:
+    `trips` reference buses with RESTRICT and every completed trip is history.
+    `status: inactive` is the removal and `maintenance` is the temporary version;
+    both take the bus out of the helper's picker, which defaults to active only,
+    while the past still resolves.
+
+    A live trip is left alone deliberately. Retiring a bus mid-route would strand
+    a helper whose app is posting fixes against it; the trip ends normally and the
+    bus is simply never offered again.
+    """
+    bus = await db.get(Bus, bus_id)
+    if bus is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown bus")
+
+    changes = body.model_dump(exclude_unset=True)
+    for field, value in changes.items():
+        setattr(bus, field, value)
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "Another bus already has that registration"
+        ) from exc
     return bus
 
 

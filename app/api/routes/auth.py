@@ -5,6 +5,7 @@ import jwt
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from redis.asyncio import Redis
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_access_claims, get_current_user
@@ -46,6 +47,16 @@ _INVALID_REFRESH = HTTPException(
 )
 
 
+# One confirmation mail per address per two minutes. Long enough that a bomb is
+# not worth attempting, short enough that someone who genuinely did not receive
+# the first one is not left waiting.
+RESEND_COOLDOWN_S = 120
+
+_EMAIL_TAKEN = HTTPException(
+    status_code=status.HTTP_409_CONFLICT, detail="Email already registered"
+)
+
+
 def _email_domain(email: str) -> str:
     return email.rsplit("@", 1)[-1].lower()
 
@@ -68,7 +79,22 @@ async def register_student(
             detail="Email domain not allowed for student registration",
         )
     if await _get_user_by_email(db, payload.email):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
+        raise _EMAIL_TAKEN
+
+    # `students.student_id_no` is unique, and a clash is ordinary: two people
+    # mistype the same roll number, or someone registers with a classmate's.
+    # Unchecked it reached the database as an IntegrityError and answered 500,
+    # which tells the student nothing about what to correct.
+    taken = (
+        await db.execute(
+            select(Student.id).where(Student.student_id_no == payload.student_id_no)
+        )
+    ).scalar_one_or_none()
+    if taken is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="That student ID is already registered",
+        )
 
     user = User(
         email=payload.email.lower(),
@@ -84,7 +110,18 @@ async def register_student(
         batch=payload.batch,
     )
     db.add(user)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        # Both checks above are check-then-insert, so a concurrent identical
+        # signup — a double-tapped button on a slow connection — can still land
+        # here. The database is the authority; this just turns its refusal into
+        # the same answer the sequential path gives instead of a 500.
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="That email or student ID is already registered",
+        ) from exc
     await db.refresh(user)
 
     # After the response, not before it. A mail relay can take seconds or hang;
@@ -104,6 +141,7 @@ async def resend_verification(
     payload: ResendVerification,
     background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
+    r: Redis = Depends(get_redis),
 ) -> dict[str, str]:
     """Send the confirmation link again.
 
@@ -115,25 +153,55 @@ async def resend_verification(
     and an unauthenticated one, since anyone who has not verified cannot log in
     to prove anything. An already-active account is also silently ignored rather
     than confirmed; the same reasoning applies.
+
+    Rate limited **per address**, which is the part nginx cannot do. Its limit is
+    per IP, so it slows one attacker down without stopping them: five a minute at
+    one inbox is three hundred an hour, and from a handful of IPs it is a mail
+    bomb sent by the university's own relay. The cooldown below is keyed on the
+    address, so the volume any single inbox can receive is fixed no matter how
+    many machines ask. A rejected resend still answers 202 — telling the caller
+    they were throttled would confirm the address is real.
     """
     user = await _get_user_by_email(db, payload.email)
     if user is not None and user.status is UserStatus.pending_email:
-        background.add_task(
-            send_verification_email,
-            to=user.email,
-            name=user.name,
-            token=create_email_verify_token(str(user.id), user.role),
-        )
+        if await _claim_resend(r, user.email):
+            background.add_task(
+                send_verification_email,
+                to=user.email,
+                name=user.name,
+                token=create_email_verify_token(str(user.id), user.role),
+            )
+        else:
+            logger.info("resend for %s suppressed by cooldown", user.email)
     else:
         logger.info("resend requested for %s — nothing to send", payload.email)
 
     return {"detail": "If that address needs confirming, a link is on its way."}
 
 
+async def _claim_resend(r: Redis, email: str) -> bool:
+    """True if this address may be mailed now, taking the slot if so.
+
+    `SET NX EX` is the whole limiter: it succeeds only if no key exists, so the
+    check and the claim are one atomic operation and concurrent requests cannot
+    both win.
+
+    Fails **open** on a Redis outage, deliberately. The opposite choice would
+    make a cache problem into "nobody can finish signing up", and the cost of
+    being wrong here is some duplicate email — while nginx's per-IP limit is
+    still standing.
+    """
+    try:
+        return bool(await r.set(f"resend:{email}", "1", ex=RESEND_COOLDOWN_S, nx=True))
+    except Exception:  # noqa: BLE001
+        logger.warning("resend cooldown unavailable; allowing the send")
+        return True
+
+
 @router.post("/register/helper", response_model=UserOut, status_code=status.HTTP_201_CREATED)
 async def register_helper(payload: HelperRegister, db: AsyncSession = Depends(get_db)) -> User:
     if await _get_user_by_email(db, payload.email):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
+        raise _EMAIL_TAKEN
 
     # Helper accounts are pending until an admin approves (spec §8).
     user = User(
@@ -146,7 +214,14 @@ async def register_helper(payload: HelperRegister, db: AsyncSession = Depends(ge
     )
     user.helper = Helper(status=HelperStatus.pending)
     db.add(user)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        # Lost the race on users.email. Registration is the one screen a helper
+        # uses on a bad connection with a slow thumb, so the double submit is not
+        # hypothetical.
+        await db.rollback()
+        raise _EMAIL_TAKEN from exc
     await db.refresh(user)
     return user
 
