@@ -27,7 +27,7 @@ from sqlalchemy import select
 
 from app.core.elasticsearch import GPS_INDEX, ensure_gps_index, get_es_client
 from app.db.session import SessionLocal
-from app.models.fleet import Route, RouteStop, Stop, Trip, TripStatus
+from app.models.fleet import RouteStop, Stop, Trip, TripStatus
 
 FIX_INTERVAL_S = 15  # one fix every 15s along the route
 
@@ -56,7 +56,7 @@ def _build_path(stops, start_ts, end_ts) -> list[dict]:
     total_s = (end_ts - start_ts).total_seconds()
     leg_s = total_s / max(len(stops) - 1, 1)
     points, t = [], start_ts
-    for a, b in zip(stops, stops[1:]):
+    for a, b in zip(stops, stops[1:], strict=False):
         steps = max(int(leg_s // FIX_INTERVAL_S), 1)
         heading = _bearing(a.lat, a.lng, b.lat, b.lng)
         avg_speed = _haversine(a.lat, a.lng, b.lat, b.lng) / (leg_s / 3600)

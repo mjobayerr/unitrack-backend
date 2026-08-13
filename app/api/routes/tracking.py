@@ -14,7 +14,6 @@ point of the split:
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Optional
 
 from elasticsearch import AsyncElasticsearch
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -274,7 +273,7 @@ async def get_bus_history_path(
     to_ts: datetime = Query(
         ..., alias="to_timestamp", description="End timestamp (ISO 8601)"
     ),
-    trip_id: Optional[uuid.UUID] = Query(None, description="Optional trip filter"),
+    trip_id: uuid.UUID | None = Query(None, description="Optional trip filter"),
     limit: int = Query(default=500, ge=1, le=5000, description="Max points to return"),
     es: AsyncElasticsearch = Depends(get_es),
     db: AsyncSession = Depends(get_db),
@@ -282,7 +281,8 @@ async def get_bus_history_path(
     """Get complete GPS path (history) for a bus within time range.
 
     Example:
-    GET /track/bus/550e8400.../history?from_timestamp=2026-07-21T08:00:00Z&to_timestamp=2026-07-21T18:00:00Z
+    GET /track/bus/550e8400.../history
+        ?from_timestamp=2026-07-21T08:00:00Z&to_timestamp=2026-07-21T18:00:00Z
     """
 
     bus = await db.get(Bus, bus_id)
