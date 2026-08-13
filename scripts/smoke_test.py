@@ -3,9 +3,10 @@
 Complements `tests/`, which is deliberately dependency-free and therefore
 cannot catch anything that only breaks against a real database, Redis or
 Elasticsearch. This walks the whole helper journey — register, approve, sign
-in, start a trip, stream GPS, report seats, raise and resolve an alert, end the
-trip, read the fix back out of Elasticsearch, then suspend the account and
-confirm access dies on the very next request.
+in, start a trip, stream GPS, report seats, subscribe to the live-map WebSocket
+and read a frame, raise and resolve an alert, end the trip, read the fix back out
+of Elasticsearch, then suspend the account and confirm access dies on the very
+next request.
 
 It asserts the failure paths too, because those are the ones that rot quietly:
 a double trip start must be refused by the partial unique index, seats without
@@ -23,12 +24,21 @@ elsewhere with SMOKE_BASE_URL. Never run it against production: it suspends the
 account it creates and writes real rows.
 """
 
+import asyncio
+import json
 import os
 import sys
 import time
 import uuid
 
 import httpx
+
+# Bundled with uvicorn[standard]; used only for the one WebSocket leg. Guarded
+# so a stripped install still runs the HTTP checks instead of failing to import.
+try:
+    import websockets
+except ImportError:  # pragma: no cover
+    websockets = None
 
 BASE_URL = os.environ.get("SMOKE_BASE_URL", "http://127.0.0.1:8000")
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@ulab.edu.bd")
@@ -44,6 +54,51 @@ failed: list[str] = []
 def check(name: str, ok: bool, detail: str = "") -> None:
     (passed if ok else failed).append(name)
     print(f"{'PASS' if ok else 'FAIL'}  {name}{'  <- ' + detail if detail else ''}")
+
+
+def _ws_url(path: str) -> str:
+    # http->ws, https->wss (str.replace on the first "http" turns "https" into
+    # "wss" too — the trailing 's' survives).
+    return BASE_URL.replace("http", "ws", 1) + path
+
+
+def check_live_track_ws(route_id: str, token: str, bus_id: str) -> None:
+    """Subscribe to the live map for the trip's route and read one frame.
+
+    Runs while the trip is live and its position is fresh in Redis, so the frame
+    must carry this bus. Also confirms a tokenless client is refused — the
+    guarding a WebSocket route cannot get from the auth-coverage test.
+    """
+    if websockets is None:
+        check("live-track WebSocket streams a frame", False, "websockets lib missing")
+        return
+
+    async def _first_frame(url: str) -> dict:
+        async with websockets.connect(url) as ws:
+            return json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+
+    try:
+        frame = asyncio.run(_first_frame(_ws_url(f"/ws/track/{route_id}?token={token}")))
+    except Exception as exc:  # noqa: BLE001 — any failure is a failed check, not a crash
+        check("live-track WebSocket streams the live bus", False, repr(exc)[:160])
+    else:
+        on_map = any(b["bus_id"] == bus_id for b in frame.get("buses", []))
+        check(
+            "live-track WebSocket streams the live bus",
+            frame.get("type") == "positions" and on_map,
+            str(frame)[:180],
+        )
+
+    async def _connect_without_token() -> bool:
+        try:
+            async with websockets.connect(_ws_url(f"/ws/track/{route_id}")) as ws:
+                await asyncio.wait_for(ws.recv(), timeout=10)
+            return True  # a frame arrived — the socket was NOT refused
+        except Exception:  # noqa: BLE001 — refusal is the pass condition
+            return False
+
+    refused = not asyncio.run(_connect_without_token())
+    check("live-track WebSocket refuses a tokenless client", refused)
 
 
 def main() -> int:
@@ -91,7 +146,8 @@ def main() -> int:
     # Approval invalidated the cached Principal, so this must work immediately.
     r = c.post("/auth/login", json={"email": helper_email, "password": helper_pw})
     check("approved helper signs in", r.status_code == 200, f"{r.status_code} {r.text[:160]}")
-    helper_h = {"authorization": f"Bearer {r.json()['access_token']}"}
+    helper_token = r.json()["access_token"]
+    helper_h = {"authorization": f"Bearer {helper_token}"}
 
     check(
         "helper is refused an admin route",
@@ -196,6 +252,11 @@ def main() -> int:
         "an absurd count is rejected",
         c.post("/helper/seats", json={"occupied": 999}, headers=helper_h).status_code == 422,
     )
+
+    # Trip is live and its position is in Redis — the moment the live map has
+    # something to show. Stream a frame over the WebSocket and confirm this bus
+    # is on it.
+    check_live_track_ws(route["id"], helper_token, bus["id"])
 
     r = c.post("/helper/alerts", json={"type": "sos", "lat": 23.75, "lng": 90.37}, headers=helper_h)
     check("sos alert", r.status_code == 201, f"{r.status_code}")

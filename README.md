@@ -29,7 +29,7 @@ No IoT hardware on buses. The **helper's smartphone is the only sensor** (GPS, Q
 
 ## Status at a glance
 
-**Functional now** — 161 unit tests, plus 37 end-to-end checks against real
+**Functional now** — 223 unit tests, plus 39 end-to-end checks against real
 Postgres + Redis + Elasticsearch ([`scripts/smoke_test.py`](scripts/smoke_test.py)).
 Both run in CI on every push ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
 
@@ -52,12 +52,12 @@ Both run in CI on every push ([`.github/workflows/ci.yml`](.github/workflows/ci.
 | **Admin catalog CRUD** — products, stops, routes (no psql needed) | ✅ |
 | **Email/SMTP** — student verification actually sends | ✅ |
 | **Live fleet map** — `GET /admin/fleet`, positions from Redis + GPS-freshness (spec §10.2) | ✅ |
+| **Live-tracking WebSocket** — `/ws/track/{route_id}`, a route's buses pushed every ~4 s (spec §7.3) | ✅ |
 
 **Not built yet** — in the spec, not started (roadmap order):
 
 | Area | Notes |
 |---|---|
-| Live-tracking WebSocket `/ws/track/{route_id}` | nginx already carries the upgrade headers; clients poll for now |
 | Materialized report tables + admin dashboards | Spec §10 |
 | `audit_logs` | Spec §6. Admin actions record `approved_by` / `acknowledged_by` on the row itself; there is no separate trail |
 
@@ -145,6 +145,7 @@ app/
     routes/auth.py        register / verify / login / refresh / me
     routes/helper.py      POST /helper/gps  (ingest)
     routes/tracking.py    GET /track/nearby (ES geo query)
+    routes/ws_track.py    WS /ws/track/{route_id} (live map feed, token via ?token=)
   worker/
     __main__.py           worker entrypoint (asyncio.gather of jobs)
     gps_es_indexer.py     gps_ingest stream → Elasticsearch
@@ -226,6 +227,7 @@ curl "localhost:8000/track/nearby?lat=23.78&lng=90.40&radius_km=5"
 | POST | `/admin/alerts/{id}/acknowledge` | Claim an alert. **admin** |
 | POST | `/admin/alerts/{id}/resolve` | Close an alert with a note. **admin** |
 | GET | `/track/nearby` | Buses within `radius_km`, closest first (ES `geo_distance`). |
+| WS | `/ws/track/{route_id}` | Live map feed: a frame per ~4 s — every live bus's position, freshness, seats, next-stop ETA. Auth via `?token=<access>` (a browser `WebSocket` can't send headers). |
 | GET | `/shop/products` | Ticket catalogue. |
 | POST | `/shop/orders` | Start a purchase; returns the gateway checkout URL. Idempotent. **student** |
 | GET | `/shop/orders` | The caller's own orders. **student** |
@@ -263,8 +265,9 @@ is **not** the password shown in the panel's store-detail view. `ipn_url` is
 only registered when `PUBLIC_BASE_URL` is publicly resolvable, so on localhost
 settlement is redirect-only.
 
-Full contract: `GET /openapi.json` (clients generate types from it). All 20
-endpoints are exercised end-to-end by [`scripts/smoke_test.py`](scripts/smoke_test.py).
+Full contract: `GET /openapi.json` (clients generate types from it). Every REST
+endpoint and the live-map WebSocket are exercised end-to-end by
+[`scripts/smoke_test.py`](scripts/smoke_test.py).
 
 ### Auth
 
@@ -350,7 +353,6 @@ Still open: an ES replica + snapshot policy — single-node ES is not durable.
 
 ## What's next
 
-- **Live tracking WebSocket**: `/ws/track/{route_id}` fan-out of position + ETA + seats (spec §7.3 step 4). Clients poll today, which works but costs a request per tick.
 - **`audit_logs`** (spec §6): who did what, as a trail rather than a column on the affected row.
 - **Reports** (§10) — `orders` and `tickets` now exist to aggregate.
 - **ES hardening**: single-node ES is not durable — add a replica + snapshot policy before production; report/fraud jobs must query ES, not Postgres joins. Elasticsearch also still runs with `xpack.security` off, kept off the public network rather than authenticated.

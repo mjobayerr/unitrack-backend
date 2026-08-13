@@ -89,6 +89,17 @@ class Settings(BaseSettings):
     # across two dates and quietly corrupting every ridership report.
     service_timezone: str = "Asia/Dhaka"
 
+    # --- Live-tracking WebSocket (/ws/track/{route_id}, spec §7.3) ---
+    # How often a subscribed client is pushed a fresh frame. The spec asks for
+    # ~5 s freshness; 4 s leaves margin for the send itself. Lower means more
+    # Redis reads per connection for little visible gain — the helper app only
+    # posts every 3–5 s, so faster frames would just repeat the last position.
+    track_ws_interval_s: float = 4.0
+    # How long a route's live-trip roster is cached before Postgres is asked
+    # again. Bounds the delay before a just-started trip appears on the map, and
+    # a just-ended one drops off. Kept under the fix TTL so a bus never lingers.
+    track_ws_roster_ttl_s: float = 8.0
+
     @property
     def database_url(self) -> str:
         return (

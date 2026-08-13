@@ -26,6 +26,7 @@ from app.api.routes import (
     shop,
     tracking,
     wallet_page,
+    ws_track,
 )
 
 # Every router in the API. `api_router` is built from this tuple rather than
@@ -42,6 +43,10 @@ ROUTERS: tuple[APIRouter, ...] = (
     shop.router,
     boarding.router,
     wallet_page.router,
+    # WebSocket-only router. Its route is an APIWebSocketRoute, so the
+    # auth-coverage test does not see it and it must not go in PUBLIC_PATHS;
+    # the guarding lives inside the handler (see app/api/routes/ws_track.py).
+    ws_track.router,
 )
 
 api_router = APIRouter()
