@@ -37,6 +37,7 @@ from app.schemas.auth import (
     LoginRequest,
     LogoutRequest,
     MeOut,
+    ProfileUpdate,
     RefreshRequest,
     ResendVerification,
     ResetPassword,
@@ -482,18 +483,13 @@ async def logout(
             await revoke(r, refresh_claims)
 
 
-@router.get("/me", response_model=MeOut)
-async def me(
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-) -> MeOut:
+async def _me_response(user: User, db: AsyncSession) -> MeOut:
     """The signed-in account plus the profile registration collected.
 
     The student row is a second SELECT rather than an eager join because
     `get_current_user` is shared by every authenticated route and most do not
     need it — the cost belongs here, at the one endpoint that returns a profile.
-    Only students have a row; helpers and admins fall through with `student`
-    null.
+    Only students have a row; helpers and admins fall through with `student` null.
     """
     student: Student | None = None
     if user.role == UserRole.student:
@@ -508,3 +504,33 @@ async def me(
         phone=user.phone,
         student=StudentProfileOut.model_validate(student) if student else None,
     )
+
+
+@router.get("/me", response_model=MeOut)
+async def me(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> MeOut:
+    return await _me_response(user, db)
+
+
+@router.patch("/me", response_model=MeOut)
+async def update_me(
+    payload: ProfileUpdate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> MeOut:
+    """Edit the fields a person owns about themselves — name and phone.
+
+    A PATCH, not a PUT: only the keys sent are touched, so a client editing the
+    name never has to echo back the phone. `phone` set to null clears it; phone
+    absent leaves it, which is why the check is on `model_fields_set` and not on
+    the value being None.
+    """
+    if payload.name is not None:
+        user.name = payload.name
+    if "phone" in payload.model_fields_set:
+        user.phone = payload.phone
+    await db.commit()
+    await db.refresh(user)
+    return await _me_response(user, db)

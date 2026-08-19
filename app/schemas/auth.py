@@ -124,3 +124,18 @@ class ResetPassword(BaseModel):
 
     token: str
     password: str = Field(min_length=8, max_length=128)
+
+
+class ProfileUpdate(BaseModel):
+    """Fields a signed-in user may change about themselves.
+
+    Only what the backend actually stores and a person owns: their display name
+    and phone. Email is the login identity and is left out on purpose — changing
+    it is a re-verification flow, not a text edit. `phone` distinguishes "clear
+    it" (explicit null) from "leave it" (absent) via `model_fields_set`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    phone: str | None = Field(default=None, max_length=32)

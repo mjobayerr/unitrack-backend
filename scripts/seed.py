@@ -727,21 +727,17 @@ async def _seed_commerce(db: AsyncSession) -> list[TicketProduct]:
         products.append(existing)
     await db.commit()
 
+    # The catalogue above is real operational data and belongs anywhere. The
+    # fixture ticket below is a dev convenience that needs the seeded student1,
+    # so on a stack without the dev users (production seeded with `commerce`
+    # alone) it is skipped rather than fatal — the products still land.
     user = await _user(db, _STUDENTS[0]["email"])
-    if user is None:
-        raise RuntimeError(
-            f"User {_STUDENTS[0]['email']} not found — run: python -m scripts.seed users"
-        )
-    # `orders.student_id` references `students.id`, not `users.id`. The two are
-    # different rows with different ids, and passing the user's gets a
-    # ForeignKeyViolationError naming a table the caller never mentioned.
     student = (
         await db.execute(select(Student).where(Student.user_id == user.id))
-    ).scalar_one_or_none()
+    ).scalar_one_or_none() if user is not None else None
     if student is None:
-        raise RuntimeError(
-            f"{_STUDENTS[0]['email']} has no student row — run: python -m scripts.seed users"
-        )
+        print("  commerce: no seed student — products seeded, skipping the fixture ticket")
+        return products
 
     # The 10-ride pack: a ticket with rides left is the more interesting fixture,
     # since it exercises the decrement path that a single ride never reaches
