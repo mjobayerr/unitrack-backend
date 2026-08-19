@@ -65,6 +65,13 @@ PUBLIC_PATHS: frozenset[str] = frozenset(
         # another — that is the entire problem it solves. Answers 202 whatever
         # the address is, so it reveals nothing.
         "/auth/resend-verification",
+        # Someone who forgot their password cannot log in to ask for a reset, so
+        # this is necessarily public. Answers 202 for every address, so it does
+        # not reveal which ones have accounts.
+        "/auth/forgot-password",
+        # The token in the emailed link IS the credential, exactly like
+        # verify-email; the endpoint sets the new password after checking it.
+        "/auth/reset-password",
         "/auth/login",  # issues the credential
         "/auth/refresh",  # the refresh token IS the credential
         "/bus-track",  # public read-only bus location lookup for clients

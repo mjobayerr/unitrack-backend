@@ -11,8 +11,12 @@ from app.core.config import settings
 _ph = PasswordHasher()
 
 ALGORITHM = "HS256"
-TokenType = Literal["access", "refresh", "email_verify"]
+TokenType = Literal["access", "refresh", "email_verify", "password_reset"]
 EMAIL_VERIFY_TTL = timedelta(days=2)
+# Short on purpose: a reset link is a bearer credential for the account, and an
+# emailed one lingers in inboxes and mail logs. An hour is long enough to walk
+# from the email to the form, short enough that a leaked link is usually dead.
+PASSWORD_RESET_TTL = timedelta(hours=1)
 
 # A hash of a value no one can present, used to spend the same CPU on a login
 # for an address that does not exist as on one that does. Computed once at
@@ -68,6 +72,10 @@ def create_refresh_token(sub: str, role: str) -> str:
 
 def create_email_verify_token(sub: str, role: str) -> str:
     return _create_token(sub, role, "email_verify", EMAIL_VERIFY_TTL)
+
+
+def create_password_reset_token(sub: str, role: str) -> str:
+    return _create_token(sub, role, "password_reset", PASSWORD_RESET_TTL)
 
 
 def decode_token(token: str, expected_type: TokenType) -> dict[str, Any]:

@@ -10,12 +10,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_access_claims, get_current_user
 from app.core.config import settings
-from app.core.email import send_verification_email
+from app.core.email import send_password_reset_email, send_verification_email
 from app.core.redis import get_redis
-from app.core.revocation import claim_rotation, is_revoked_strict, recall_rotation, revoke
+from app.core.revocation import (
+    claim_rotation,
+    is_revoked,
+    is_revoked_strict,
+    recall_rotation,
+    revoke,
+)
 from app.core.security import (
     create_access_token,
     create_email_verify_token,
+    create_password_reset_token,
     create_refresh_token,
     decode_token,
     hash_password,
@@ -25,12 +32,14 @@ from app.core.security import (
 from app.db.session import get_db
 from app.models.user import Helper, HelperStatus, Student, User, UserRole, UserStatus
 from app.schemas.auth import (
+    ForgotPassword,
     HelperRegister,
     LoginRequest,
     LogoutRequest,
     MeOut,
     RefreshRequest,
     ResendVerification,
+    ResetPassword,
     StudentProfileOut,
     StudentRegister,
     TokenPair,
@@ -53,6 +62,17 @@ _INVALID_REFRESH = HTTPException(
 # not worth attempting, short enough that someone who genuinely did not receive
 # the first one is not left waiting.
 RESEND_COOLDOWN_S = 120
+
+# One reset link per address per two minutes, same reasoning as the resend
+# cooldown: enough to stop a mail bomb, not so long that a genuine retry waits.
+RESET_COOLDOWN_S = 120
+
+# Every way a reset can fail — bad, tampered, expired, or already-used token, or
+# a user that vanished — answers the same, so nothing tells a "bad token" from
+# "no such account".
+_INVALID_RESET = HTTPException(
+    status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset link"
+)
 
 _EMAIL_TAKEN = HTTPException(
     status_code=status.HTTP_409_CONFLICT, detail="Email already registered"
@@ -198,6 +218,99 @@ async def _claim_resend(r: Redis, email: str) -> bool:
     except Exception:  # noqa: BLE001
         logger.warning("resend cooldown unavailable; allowing the send")
         return True
+
+
+@router.post("/forgot-password", status_code=status.HTTP_202_ACCEPTED)
+async def forgot_password(
+    payload: ForgotPassword,
+    background: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    r: Redis = Depends(get_redis),
+) -> dict[str, str]:
+    """Email a password-reset link.
+
+    Always answers 202, whatever is true of the address — the same enumeration
+    defence as `/auth/resend-verification`, and it matters more here because
+    this endpoint is reachable by anyone: a person who forgot their password
+    cannot log in to prove who they are. "No such account" would turn it into a
+    membership oracle for the whole university.
+
+    Rate limited **per address** — the part nginx's per-IP limit cannot do —
+    so the volume any one inbox can be sent is fixed no matter how many IPs ask.
+    A throttled request still answers 202; saying "slow down" would confirm the
+    address is real.
+
+    The link is only ever mailed to the address on file, so a stranger asking to
+    reset someone else's password just sends that person a link they can ignore.
+    """
+    user = await _get_user_by_email(db, payload.email)
+    if user is not None:
+        if await _claim_reset(r, user.email):
+            background.add_task(
+                send_password_reset_email,
+                to=user.email,
+                name=user.name,
+                token=create_password_reset_token(str(user.id), user.role),
+            )
+        else:
+            logger.info("reset for %s suppressed by cooldown", user.email)
+    else:
+        logger.info("reset requested for %s — no such account", payload.email)
+
+    return {"detail": "If that address has an account, a reset link is on its way."}
+
+
+async def _claim_reset(r: Redis, email: str) -> bool:
+    """True if this address may be sent a reset link now, taking the slot if so.
+
+    `SET NX EX` makes the check and the claim one atomic step. Fails **open** on
+    a Redis outage for the same reason the resend cooldown does: a cache problem
+    must not become "nobody can recover their account", and nginx's per-IP limit
+    is still standing behind it.
+    """
+    try:
+        return bool(await r.set(f"reset:{email}", "1", ex=RESET_COOLDOWN_S, nx=True))
+    except Exception:  # noqa: BLE001
+        logger.warning("reset cooldown unavailable; allowing the send")
+        return True
+
+
+@router.post("/reset-password", status_code=status.HTTP_204_NO_CONTENT)
+async def reset_password(
+    payload: ResetPassword,
+    db: AsyncSession = Depends(get_db),
+    r: Redis = Depends(get_redis),
+) -> None:
+    """Consume a reset token and set a new password.
+
+    The token's signature and `password_reset` type are the whole
+    authorization — holding it proves control of the mailbox it was sent to.
+
+    Single-use: the token's `jti` is denied-listed on success, so a reset link
+    that leaks from an inbox or a mail log cannot be replayed to change the
+    password again. The check fails **open** on a Redis outage (a rare recovery
+    action must not be blocked by a cache blip), which at worst allows a second
+    use inside the token's one-hour life — not a token that lives forever.
+    """
+    try:
+        claims = decode_token(payload.token, expected_type="password_reset")
+        user_id = uuid.UUID(claims["sub"])
+    except (jwt.InvalidTokenError, KeyError, ValueError) as exc:
+        raise _INVALID_RESET from exc
+
+    if await is_revoked(r, claims["jti"]):
+        raise _INVALID_RESET
+
+    user = await db.get(User, user_id)
+    if user is None:
+        raise _INVALID_RESET
+
+    user.password_hash = hash_password(payload.password)
+    await db.commit()
+
+    # After the password is committed, so a failed revoke cannot strand a user
+    # who cannot then reset — it only leaves the just-used link briefly replayable.
+    await revoke(r, claims)
 
 
 @router.post("/register/helper", response_model=UserOut, status_code=status.HTTP_201_CREATED)

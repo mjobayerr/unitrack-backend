@@ -43,6 +43,16 @@ def verification_link(token: str) -> str:
     return f"{settings.verify_link_base}/verify?token={quote(token, safe='')}"
 
 
+def reset_link(token: str) -> str:
+    """Where the student clicks to choose a new password.
+
+    Same origin as the verification link — the student app, not the API — for
+    the same reason: a person reads it. `/reset-password` is a public route that
+    reads the token from the query and posts it back with the new password.
+    """
+    return f"{settings.verify_link_base}/reset-password?token={quote(token, safe='')}"
+
+
 def _build(to: str, name: str, link: str) -> EmailMessage:
     """Plain text and HTML. Mail clients that refuse HTML still get the link,
     and — more to the point — so does anyone reading it in a terminal."""
@@ -82,24 +92,62 @@ def _build(to: str, name: str, link: str) -> EmailMessage:
     return message
 
 
-async def send_verification_email(*, to: str, name: str, token: str) -> bool:
-    """Best effort. Returns whether it was actually handed to a relay.
+def _build_reset(to: str, name: str, link: str) -> EmailMessage:
+    """Plain text and HTML, same shape as `_build`. A different subject and body
+    because a "reset your password" mail arriving unbidden must tell the reader
+    to ignore it — an unrequested one is the first sign of someone probing the
+    account."""
+    message = EmailMessage()
+    message["From"] = settings.smtp_from
+    message["To"] = to
+    message["Subject"] = "Reset your UniTrack password"
 
-    Never raises. Called from a background task after registration has already
-    responded 201, so raising here would take down a request that has finished
-    and leave nothing but a confusing traceback.
+    message.set_content(
+        f"Hi {name},\n\n"
+        "We received a request to reset your UniTrack password. Choose a new "
+        "one here:\n\n"
+        f"{link}\n\n"
+        "The link is valid for one hour. If you did not ask for this, ignore "
+        "this message — your password stays the same.\n"
+    )
+    message.add_alternative(
+        f"""<!doctype html>
+<html><body style="font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
+                   color:#1f2937;line-height:1.55">
+  <p>Hi {name},</p>
+  <p>We received a request to reset your UniTrack password.</p>
+  <p><a href="{link}"
+        style="display:inline-block;background:#1a3c8f;color:#fff;
+               padding:11px 18px;border-radius:8px;text-decoration:none;
+               font-weight:600">Choose a new password</a></p>
+  <p style="color:#6b7280;font-size:13px">
+    Or paste this into your browser:<br>
+    <span style="word-break:break-all">{link}</span>
+  </p>
+  <p style="color:#6b7280;font-size:13px">
+    The link is valid for one hour. If you did not ask for this, ignore this
+    message — your password stays the same.
+  </p>
+</body></html>""",
+        subtype="html",
+    )
+    return message
+
+
+async def _deliver(message: EmailMessage, *, to: str, what: str, link: str) -> bool:
+    """Hand a built message to the relay. Best effort, never raises.
+
+    `what`/`link` exist only for the disabled-relay and failure logs, so a
+    developer with no SMTP sees exactly what would have been sent — the
+    behaviour the app had before this module existed.
     """
-    link = verification_link(token)
-
     if not settings.email_enabled:
-        # The pre-SMTP behaviour, kept deliberately: a developer with no relay
-        # copies this out of the log and carries on.
-        logger.info("email disabled — verification link for %s: %s", to, link)
+        logger.info("email disabled — %s link for %s: %s", what, to, link)
         return False
 
     try:
         await aiosmtplib.send(
-            _build(to, name, link),
+            message,
             hostname=settings.smtp_host,
             port=settings.smtp_port,
             username=settings.smtp_user or None,
@@ -111,11 +159,30 @@ async def send_verification_email(*, to: str, name: str, token: str) -> bool:
             timeout=15,
         )
     except Exception:  # noqa: BLE001 — see the module docstring
-        # The address is logged; the token is not. A verification token is a
-        # credential — anyone holding it can activate that account — and log
-        # aggregators are read by more people than a mailbox is.
-        logger.exception("could not send verification email to %s", to)
+        # The address is logged; the token in the link is not. That token is a
+        # credential, and log aggregators are read by more people than a mailbox.
+        logger.exception("could not send %s email to %s", what, to)
         return False
 
-    logger.info("verification email sent to %s", to)
+    logger.info("%s email sent to %s", what, to)
     return True
+
+
+async def send_verification_email(*, to: str, name: str, token: str) -> bool:
+    """Best effort. Returns whether it was actually handed to a relay.
+
+    Never raises. Called from a background task after registration has already
+    responded 201, so raising here would take down a request that has finished
+    and leave nothing but a confusing traceback.
+    """
+    link = verification_link(token)
+    return await _deliver(_build(to, name, link), to=to, what="verification", link=link)
+
+
+async def send_password_reset_email(*, to: str, name: str, token: str) -> bool:
+    """Best effort, never raises. Called from a background task after the
+    endpoint has already answered 202, so a mail failure cannot change the
+    reply the caller sees — which is what keeps the endpoint from leaking
+    whether the address exists."""
+    link = reset_link(token)
+    return await _deliver(_build_reset(to, name, link), to=to, what="password-reset", link=link)

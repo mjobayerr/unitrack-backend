@@ -102,3 +102,25 @@ class ResendVerification(BaseModel):
     """
 
     email: EmailStr
+
+
+class ForgotPassword(BaseModel):
+    """Ask for a password-reset link.
+
+    Only an address, because the caller has by definition lost the credential
+    that would authenticate anything more.
+    """
+
+    email: EmailStr
+
+
+class ResetPassword(BaseModel):
+    """Set a new password using the token from the emailed link.
+
+    `token` is the whole authentication — holding it proves control of the
+    mailbox. `password` mirrors the registration constraints so the rules a
+    student met at signup are the rules they meet here.
+    """
+
+    token: str
+    password: str = Field(min_length=8, max_length=128)
