@@ -14,6 +14,7 @@ import uuid
 
 from pydantic import BaseModel
 
+from app.models.fleet import RouteDirection
 from app.schemas.admin import GpsFreshness
 
 
@@ -57,3 +58,30 @@ class TrackFrame(BaseModel):
     stale: int
     lost: int
     buses: list[TrackBusFrame]
+
+
+class LiveFleetBus(TrackBusFrame):
+    """A live bus plus the route it runs.
+
+    The per-route frame leaves route out — the subscriber already knows it from
+    the path. The dashboard has picked no route, so it needs the route named on
+    every bus to say "Bus 3 · Campus Shuttle" without a second lookup."""
+
+    route_id: uuid.UUID
+    route_name: str
+    route_direction: RouteDirection
+
+
+class LiveFleetOut(BaseModel):
+    """Every live bus across every route in one snapshot.
+
+    Feeds a dashboard that features whatever is actually running before the
+    student has chosen a route — unlike the per-route WebSocket, which only ever
+    knows about the one route it was opened for."""
+
+    generated_at: datetime.datetime
+    total: int
+    live: int
+    stale: int
+    lost: int
+    buses: list[LiveFleetBus]

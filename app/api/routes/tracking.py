@@ -23,12 +23,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_authenticated
 from app.core.elasticsearch import GPS_INDEX, get_es
-from app.core.redis import get_redis, trip_eta_key
+from app.core.redis import bus_pos_key, bus_seats_key, get_redis, trip_eta_key
 from app.db.session import get_db
 from app.models.fleet import Bus, Route, RouteStop, Stop, Trip, TripStatus
+from app.schemas.admin import GpsFreshness
 from app.schemas.gps import BusHistoryPathOut, GpsPoint
+from app.schemas.live_track import LiveFleetBus, LiveFleetOut
 from app.schemas.trip import BusArrivalOut, StopArrivalsOut, TripEtaOut
-from app.services.fleet_view import minutes_until
+from app.services.fleet_view import (
+    age_seconds,
+    classify,
+    minutes_until,
+    next_stop_minutes,
+    parse_position,
+    parse_seats,
+)
 
 # Any signed-in, active account may look up buses — students, helpers, admins
 # all need it. Not public: live vehicle positions are the fleet's whereabouts,
@@ -94,6 +103,97 @@ def build_nearby_query(
             {"_geo_distance": {"location": origin, "order": "asc", "unit": "km"}},
         ],
     }
+
+
+@router.get("/live", response_model=LiveFleetOut)
+async def live_fleet(
+    db: AsyncSession = Depends(get_db),
+    r: Redis = Depends(get_redis),
+) -> LiveFleetOut:
+    """Every live bus across every route, in one snapshot.
+
+    The same Redis-only picture the per-route WebSocket draws, but for the whole
+    fleet at once, so the student dashboard can feature whatever is actually
+    running instead of guessing a single route (which is how it ended up saying
+    "no buses live" while a bus ran on another route). A snapshot, not a stream —
+    the live map is where a student watches a bus move.
+
+    Position is aged by the server's receive time, not the phone's clock, so a
+    helper with a wrong clock still reads as live (see fleet_view.Position).
+    """
+    now = datetime.now(UTC)
+    rows = (
+        await db.execute(
+            select(
+                Trip.id,
+                Bus.id,
+                Bus.reg_no,
+                Bus.nickname,
+                Bus.capacity,
+                Route.id,
+                Route.name,
+                Route.direction,
+            )
+            .join(Bus, Bus.id == Trip.bus_id)
+            .join(Route, Route.id == Trip.route_id)
+            .where(Trip.status == TripStatus.live)
+            .order_by(Trip.actual_start)
+        )
+    ).all()
+    if not rows:
+        return LiveFleetOut(generated_at=now, total=0, live=0, stale=0, lost=0, buses=[])
+
+    # One pipeline for the whole fleet: position, seats and cached ETA per bus.
+    pipe = r.pipeline(transaction=False)
+    for trip_id, bus_id, *_ in rows:
+        pipe.hgetall(bus_pos_key(str(bus_id)))
+        pipe.hgetall(bus_seats_key(str(bus_id)))
+        pipe.get(trip_eta_key(str(trip_id)))
+    try:
+        reads = await pipe.execute()
+    except Exception:  # noqa: BLE001 — a cache miss must not blank the board
+        reads = [None] * (len(rows) * 3)
+
+    tally = {GpsFreshness.live: 0, GpsFreshness.stale: 0, GpsFreshness.lost: 0}
+    buses: list[LiveFleetBus] = []
+    for i, row in enumerate(rows):
+        trip_id, bus_id, reg_no, nickname, capacity, route_id, route_name, direction = row
+        raw_pos, raw_seats, raw_eta = reads[i * 3 : i * 3 + 3]
+        position = parse_position(raw_pos)
+        age = age_seconds((position.ingested_at or position.ts) if position else None, now)
+        freshness = classify(age)
+        tally[freshness] += 1
+        occupied, seat_capacity = parse_seats(raw_seats)
+        buses.append(
+            LiveFleetBus(
+                trip_id=trip_id,
+                bus_id=bus_id,
+                reg_no=reg_no,
+                nickname=nickname,
+                lat=position.lat if position else None,
+                lng=position.lng if position else None,
+                heading=position.heading if position else None,
+                speed_kmh=position.speed_kmh if position else None,
+                fix_ts=position.ts if position else None,
+                fix_age_s=age,
+                freshness=freshness,
+                occupied=occupied,
+                capacity=seat_capacity if seat_capacity is not None else capacity,
+                next_stop_eta_minutes=next_stop_minutes(raw_eta, now),
+                route_id=route_id,
+                route_name=route_name,
+                route_direction=direction,
+            )
+        )
+
+    return LiveFleetOut(
+        generated_at=now,
+        total=len(buses),
+        live=tally[GpsFreshness.live],
+        stale=tally[GpsFreshness.stale],
+        lost=tally[GpsFreshness.lost],
+        buses=buses,
+    )
 
 
 @router.get("/nearby")
