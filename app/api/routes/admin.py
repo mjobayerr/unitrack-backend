@@ -306,7 +306,9 @@ async def live_fleet(
         raw_pos, raw_seats, raw_eta = cached[index * 3 : index * 3 + 3]
 
         position = parse_position(raw_pos)
-        age = age_seconds(position.ts if position else None, now)
+        # Server receive time, not the phone's clock — a bus with a wrong clock
+        # is still live. See fleet_view.Position.
+        age = age_seconds((position.ingested_at or position.ts) if position else None, now)
         freshness = classify(age)
         tally[freshness] += 1
         occupied, capacity = parse_seats(raw_seats)

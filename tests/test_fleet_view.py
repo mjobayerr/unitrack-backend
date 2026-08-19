@@ -145,6 +145,30 @@ def test_a_corrupt_hash_reads_as_no_position_rather_than_raising() -> None:
     assert parse_position({"lat": "23.7", "lng": "90.3"}) is None  # no ts
 
 
+def test_freshness_uses_server_ingest_time_not_the_phone_clock() -> None:
+    """A helper whose phone clock is two minutes slow is still live: the fix was
+    just received, so freshness is measured against `ingested_at`, not the stale
+    timestamp the phone stamped on it. Without this, a wrong clock — common on
+    cheap phones — makes an actively-tracking bus read as stale."""
+    position = parse_position(
+        _pos(ts=(NOW - timedelta(minutes=2)).isoformat(), ingested_at=NOW.isoformat())
+    )
+    assert position is not None
+    age = age_seconds(position.ingested_at or position.ts, NOW)
+    assert age == 0
+    assert classify(age) is GpsFreshness.live
+
+
+def test_freshness_falls_back_to_fix_time_when_ingest_time_is_absent() -> None:
+    """Fixes stored before `ingested_at` existed still age by `ts`."""
+    legacy = _pos(ts=(NOW - timedelta(seconds=90)).isoformat())
+    del legacy["ingested_at"]
+    position = parse_position(legacy)
+    assert position is not None
+    assert position.ingested_at is None
+    assert classify(age_seconds(position.ingested_at or position.ts, NOW)) is GpsFreshness.stale
+
+
 # --- seats -----------------------------------------------------------------
 
 

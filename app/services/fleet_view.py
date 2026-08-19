@@ -37,13 +37,18 @@ LIVE_MAX_AGE_S = 60
 @dataclass(frozen=True, slots=True)
 class Position:
     """A decoded `bus:{id}:pos` hash. Every field optional: the hash is written
-    by a phone, and speed and heading are absent on a stationary first fix."""
+    by a phone, and speed and heading are absent on a stationary first fix.
+
+    `ts` is the fix time the *phone* reported; `ingested_at` is when the server
+    received it. Freshness is measured against `ingested_at`, because a bus with
+    a wrong clock is still live — see `age_seconds`."""
 
     lat: float
     lng: float
     ts: datetime
     heading: float | None = None
     speed_kmh: float | None = None
+    ingested_at: datetime | None = None
 
 
 def classify(age_s: float | None) -> GpsFreshness:
@@ -69,6 +74,7 @@ def parse_position(raw: dict[str, str] | None) -> Position | None:
     if not raw:
         return None
     try:
+        ingested_at = raw.get("ingested_at")
         return Position(
             lat=float(raw["lat"]),
             lng=float(raw["lng"]),
@@ -77,6 +83,8 @@ def parse_position(raw: dict[str, str] | None) -> Position | None:
             # The helper app sends geolocator's metres per second; the console
             # shows km/h. Converted here so no client has to know that.
             speed_kmh=_ms_to_kmh(_opt_float(raw.get("speed"))),
+            # Older fixes predate this field; freshness falls back to `ts` then.
+            ingested_at=datetime.fromisoformat(ingested_at) if ingested_at else None,
         )
     except (KeyError, ValueError, TypeError):
         logger.warning("unusable position hash, treating bus as lost: %r", raw)
