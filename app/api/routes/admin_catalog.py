@@ -22,15 +22,15 @@ so the database refuses and this turns that into a 409 rather than a 500.
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.api.deps import require_admin
 from app.db.session import get_db
 from app.models.commerce import TicketProduct
 from app.models.fleet import Route, RouteStop, Stop
+from app.repositories import commerce as commerce_repo
+from app.repositories import fleet as fleet_repo
 from app.schemas.commerce import AdminProductOut, ProductCreate, ProductUpdate
 from app.schemas.fleet import (
     RouteCreate,
@@ -74,10 +74,7 @@ async def list_products(
     can buy, while an operator has to see what they retired last month in order
     to bring it back.
     """
-    stmt = select(TicketProduct)
-    if not include_inactive:
-        stmt = stmt.where(TicketProduct.active.is_(True))
-    return list((await db.execute(stmt.order_by(TicketProduct.price_paisa))).scalars())
+    return await commerce_repo.list_products(db, active_only=not include_inactive)
 
 
 @router.post("/products", response_model=AdminProductOut, status_code=status.HTTP_201_CREATED)
@@ -86,7 +83,7 @@ async def create_product(
     db: AsyncSession = Depends(get_db),
 ) -> TicketProduct:
     """Put something on sale."""
-    if body.route_scope is not None and await db.get(Route, body.route_scope) is None:
+    if body.route_scope is not None and await fleet_repo.get_route(db, body.route_scope) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown route for route_scope")
 
     product = TicketProduct(**body.model_dump())
@@ -107,13 +104,13 @@ async def update_product(
     the route scope alone" — both arrive as `route_scope: null` otherwise, and
     every edit to a price would silently unscope the product.
     """
-    product = await db.get(TicketProduct, product_id)
+    product = await commerce_repo.get_product(db, product_id)
     if product is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown product")
 
     changes = body.model_dump(exclude_unset=True)
     scope = changes.get("route_scope")
-    if scope is not None and await db.get(Route, scope) is None:
+    if scope is not None and await fleet_repo.get_route(db, scope) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown route for route_scope")
 
     for field, value in changes.items():
@@ -141,7 +138,7 @@ async def update_stop(
     body: StopUpdate,
     db: AsyncSession = Depends(get_db),
 ) -> Stop:
-    stop = await db.get(Stop, stop_id)
+    stop = await fleet_repo.get_stop(db, stop_id)
     if stop is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown stop")
 
@@ -160,13 +157,11 @@ async def delete_stop(stop_id: uuid.UUID, db: AsyncSession = Depends(get_db)) ->
     who is told "in use by 2 routes" knows what to do next; one who is told
     "integrity error" does not.
     """
-    stop = await db.get(Stop, stop_id)
+    stop = await fleet_repo.get_stop(db, stop_id)
     if stop is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown stop")
 
-    in_use = len(
-        (await db.execute(select(RouteStop.route_id).where(RouteStop.stop_id == stop_id))).all()
-    )
+    in_use = await fleet_repo.routes_using_stop(db, stop_id)
     if in_use:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -192,13 +187,7 @@ async def _route_detail(db: AsyncSession, route_id: uuid.UUID) -> RouteDetailOut
     that same stale object — a reorder would answer with the previous order and
     look, to whoever just saved it, like the change had not stuck.
     """
-    stmt = (
-        select(Route)
-        .where(Route.id == route_id)
-        .options(selectinload(Route.stops).selectinload(RouteStop.stop))
-        .execution_options(populate_existing=True)
-    )
-    route = (await db.execute(stmt)).scalar_one_or_none()
+    route = await fleet_repo.get_route_with_stops(db, route_id, populate_existing=True)
     if route is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown route")
 
@@ -251,7 +240,7 @@ async def update_route(
     safe removal — it disappears from `/fleet/routes` while the past still
     resolves.
     """
-    route = await db.get(Route, route_id)
+    route = await fleet_repo.get_route(db, route_id)
     if route is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown route")
 
@@ -285,7 +274,7 @@ async def replace_route_stops(
     there. Both halves are one transaction, so a bad stop id leaves the existing
     route untouched rather than wiping it.
     """
-    if await db.get(Route, route_id) is None:
+    if await fleet_repo.get_route(db, route_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown route")
 
     stop_ids = [s.stop_id for s in body.stops]
@@ -295,15 +284,13 @@ async def replace_route_stops(
         # data model change, not a retry.
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "A stop is listed more than once")
 
-    known = set(
-        (await db.execute(select(Stop.id).where(Stop.id.in_(stop_ids)))).scalars()
-    )
+    known = await fleet_repo.existing_stop_ids(db, stop_ids)
     if missing := [str(s) for s in stop_ids if s not in known]:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, f"Unknown stop(s): {', '.join(missing)}"
         )
 
-    await db.execute(delete(RouteStop).where(RouteStop.route_id == route_id))
+    await fleet_repo.clear_route_stops(db, route_id)
     await db.flush()
 
     db.add_all(

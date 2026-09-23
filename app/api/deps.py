@@ -37,7 +37,8 @@ from app.core.redis import get_redis
 from app.core.revocation import is_revoked
 from app.core.security import decode_token
 from app.db.session import get_db
-from app.models.user import User, UserRole, UserStatus
+from app.models.user import Student, User, UserRole, UserStatus
+from app.repositories import users as user_repo
 
 _bearer = HTTPBearer(auto_error=True)
 
@@ -154,7 +155,29 @@ async def get_current_user(
     (e.g. `GET /auth/me`). For authorization, `Principal` already has what you
     need and is cached.
     """
-    user = await db.get(User, principal.user_id)
+    user = await user_repo.get(db, principal.user_id)
     if user is None:
         raise _CREDENTIALS_EXC
     return user
+
+
+async def get_current_student(
+    principal: Principal = Depends(require_student),
+    db: AsyncSession = Depends(get_db),
+) -> Student:
+    """The `Student` row for the authenticated student account.
+
+    Resolving the caller's `Principal` to their profile row is the join every
+    student-facing endpoint — wallet, orders, boarding QR — needs before it can
+    act, so it lives here in one place rather than being re-selected in each
+    router (it used to be `shop._student_for` and a copy inside `boarding`).
+
+    Guarded by `require_student`, so the role and active checks have already run.
+    A student-role account with no student row is a *data* fault, not a
+    permission one; answering 409 rather than 403 keeps the caller from hunting
+    for an access problem that is not there.
+    """
+    student = await user_repo.student_by_user_id(db, principal.user_id)
+    if student is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Account has no student profile")
+    return student

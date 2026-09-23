@@ -11,13 +11,12 @@ development corridor can be seeded with `python -m scripts.seed stops routes`.
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.api.deps import require_authenticated
 from app.db.session import get_db
-from app.models.fleet import Bus, BusStatus, Route, RouteStop, Stop
+from app.models.fleet import Bus, BusStatus, Route, Stop
+from app.repositories import fleet as fleet_repo
 from app.schemas.fleet import BusOut, RouteDetailOut, RouteOut, RouteStopOut, StopOut
 
 router = APIRouter(
@@ -37,10 +36,7 @@ async def list_buses(
     Replaces typing a UUID by hand, which was the previous state of affairs and
     is exactly as error-prone as it sounds.
     """
-    stmt = select(Bus)
-    if only_active:
-        stmt = stmt.where(Bus.status == BusStatus.active)
-    return list((await db.execute(stmt.order_by(Bus.reg_no))).scalars())
+    return await fleet_repo.list_buses(db, BusStatus.active if only_active else None)
 
 
 @router.get("/routes", response_model=list[RouteOut])
@@ -48,10 +44,7 @@ async def list_routes(
     db: AsyncSession = Depends(get_db),
     only_active: bool = Query(default=True),
 ) -> list[Route]:
-    stmt = select(Route)
-    if only_active:
-        stmt = stmt.where(Route.is_active.is_(True))
-    return list((await db.execute(stmt.order_by(Route.name, Route.direction))).scalars())
+    return await fleet_repo.list_routes(db, only_active)
 
 
 @router.get("/route-shapes", response_model=list[RouteDetailOut])
@@ -75,10 +68,7 @@ async def list_route_shapes(
     response *shape* cannot be expressed in one `response_model`, so the
     generated client would type the stops as always-present or never.
     """
-    stmt = select(Route).options(selectinload(Route.stops).selectinload(RouteStop.stop))
-    if only_active:
-        stmt = stmt.where(Route.is_active.is_(True))
-    routes = (await db.execute(stmt.order_by(Route.name, Route.direction))).scalars().all()
+    routes = await fleet_repo.list_routes_with_stops(db, only_active)
 
     return [
         RouteDetailOut(
@@ -108,16 +98,11 @@ async def list_route_shapes(
 async def get_route(route_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> RouteDetailOut:
     """One route with its ordered stops — what the map draws.
 
-    `selectinload` fetches route_stops and their stops in two extra queries
-    rather than one per stop. The lazy default would issue an N+1 storm on a
-    route with thirty stops, on an endpoint every map load hits.
+    `get_route_with_stops` fetches route_stops and their stops in two extra
+    queries rather than one per stop. The lazy default would issue an N+1 storm
+    on a route with thirty stops, on an endpoint every map load hits.
     """
-    stmt = (
-        select(Route)
-        .where(Route.id == route_id)
-        .options(selectinload(Route.stops).selectinload(RouteStop.stop))
-    )
-    route = (await db.execute(stmt)).scalar_one_or_none()
+    route = await fleet_repo.get_route_with_stops(db, route_id)
     if route is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown route")
 
@@ -140,4 +125,4 @@ async def get_route(route_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> 
 
 @router.get("/stops", response_model=list[StopOut])
 async def list_stops(db: AsyncSession = Depends(get_db)) -> list[Stop]:
-    return list((await db.execute(select(Stop).order_by(Stop.name))).scalars())
+    return await fleet_repo.list_stops(db)

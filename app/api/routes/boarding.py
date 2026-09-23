@@ -19,15 +19,15 @@ from datetime import UTC, datetime
 
 import qrcode
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import require_approved_helper, require_student
+from app.api.deps import get_current_student, require_approved_helper
 from app.core.authz import Principal
 from app.db.session import get_db
 from app.models.commerce import Ticket, TicketStatus
-from app.models.user import Student, User
+from app.models.user import Student
+from app.repositories import commerce as commerce_repo
 from app.schemas.commerce import (
     ManifestTicketOut,
     QrMaterialOut,
@@ -64,23 +64,17 @@ CODE_MAX_LEN = 512
 
 
 async def _own_active_ticket(
-    db: AsyncSession, principal: Principal, ticket_id: uuid.UUID
+    db: AsyncSession, student: Student, ticket_id: uuid.UUID
 ) -> Ticket:
     """The caller's own active ticket, or a 404.
 
     The id in the path is never trusted on its own — it is checked against the
-    caller's student row. Without that, anyone could ask for any ticket's
-    private key by guessing a uuid, which would hand them the whole system.
-    "Not yours" and "does not exist" get the same answer, so this cannot be
-    used to discover which ticket ids are real.
+    caller's student row (resolved by `get_current_student`). Without that,
+    anyone could ask for any ticket's private key by guessing a uuid, which
+    would hand them the whole system. "Not yours" and "does not exist" get the
+    same answer, so this cannot be used to discover which ticket ids are real.
     """
-    student = (
-        await db.execute(select(Student).where(Student.user_id == principal.user_id))
-    ).scalar_one_or_none()
-    if student is None:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Account has no student profile")
-
-    ticket = await db.get(Ticket, ticket_id)
+    ticket = await commerce_repo.get_ticket(db, ticket_id)
     if ticket is None or ticket.student_id != student.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Ticket not found")
     if ticket.status is not TicketStatus.active:
@@ -91,7 +85,7 @@ async def _own_active_ticket(
 @router.get("/shop/tickets/{ticket_id}/qr-material", response_model=QrMaterialOut)
 async def qr_material(
     ticket_id: uuid.UUID,
-    principal: Principal = Depends(require_student),
+    student: Student = Depends(get_current_student),
     db: AsyncSession = Depends(get_db),
 ) -> QrMaterialOut:
     """Hand a student's device what it needs to generate boarding codes offline.
@@ -101,7 +95,7 @@ async def qr_material(
     student could ask for any ticket's private key by guessing a uuid, which
     would hand them the whole system.
     """
-    ticket = await _own_active_ticket(db, principal, ticket_id)
+    ticket = await _own_active_ticket(db, student, ticket_id)
 
     return QrMaterialOut(
         ticket_id=ticket.id,
@@ -123,7 +117,7 @@ async def qr_material(
 )
 async def qr_image(
     ticket_id: uuid.UUID,
-    principal: Principal = Depends(require_student),
+    student: Student = Depends(get_current_student),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
     """Render the current boarding code as a PNG.
@@ -139,7 +133,7 @@ async def qr_image(
     image is a rejected passenger; `no-store` also keeps it out of any proxy
     between here and the phone.
     """
-    ticket = await _own_active_ticket(db, principal, ticket_id)
+    ticket = await _own_active_ticket(db, student, ticket_id)
 
     code = build_qr(
         ticket.qr_private_key,
@@ -184,26 +178,6 @@ async def ticket_manifest(
     window is the time since their last sync.
     """
     now = datetime.now(UTC)
-    # Explicitly joined rather than walked through relationships: this runs once
-    # per trip start for every active ticket in the fleet, and a lazy load per
-    # row would turn one query into thousands.
-    stmt = (
-        select(
-            Ticket.id,
-            Ticket.qr_public_key,
-            Ticket.rides_remaining,
-            Ticket.valid_to,
-            Ticket.status,
-            User.name,
-            Student.student_id_no,
-        )
-        .join(Student, Student.id == Ticket.student_id)
-        .join(User, User.id == Student.user_id)
-        .where(Ticket.status == TicketStatus.active, Ticket.valid_to >= now)
-        .order_by(Ticket.valid_to)
-        .limit(limit)
-    )
-
     return [
         ManifestTicketOut(
             ticket_id=row.id,
@@ -214,7 +188,7 @@ async def ticket_manifest(
             valid_to=row.valid_to,
             status=row.status,
         )
-        for row in (await db.execute(stmt)).all()
+        for row in await commerce_repo.active_manifest(db, now, limit)
     ]
 
 
@@ -262,7 +236,7 @@ async def sync_redemptions(
                 trip_id=item.trip_id,
             )
             await db.flush()
-            ticket = await db.get(Ticket, redemption.ticket_id)
+            ticket = await commerce_repo.get_ticket(db, redemption.ticket_id)
             await db.commit()
 
             results.append(

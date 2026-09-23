@@ -20,7 +20,6 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from redis.asyncio import Redis
-from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,9 +32,12 @@ from app.core.redis import (
     trip_eta_key,
 )
 from app.db.session import get_db
-from app.models.fleet import Bus, BusStatus, Route, Trip, TripStatus
+from app.models.fleet import Bus, BusStatus
 from app.models.ops import Alert, AlertStatus
 from app.models.user import Helper, HelperStatus, User, UserStatus
+from app.repositories import fleet as fleet_repo
+from app.repositories import ops as ops_repo
+from app.repositories import users as user_repo
 from app.schemas.admin import (
     FleetBusOut,
     FleetOut,
@@ -102,10 +104,7 @@ async def list_helpers(
     Note there is no auth code in this handler. The router guard already ran;
     by the time we are here the caller is a known, active admin.
     """
-    stmt = select(User, Helper).join(Helper, Helper.user_id == User.id)
-    if helper_status is not None:
-        stmt = stmt.where(Helper.status == helper_status)
-    rows = (await db.execute(stmt.order_by(User.created_at))).all()
+    rows = await user_repo.helpers_with_users(db, helper_status)
     return [_to_out(user, helper) for user, helper in rows]
 
 
@@ -128,13 +127,13 @@ async def approve_helper(
     admin: Principal = Depends(require_admin),
 ) -> HelperOut:
     """Approve a pending helper so they can start sending GPS (spec §8)."""
-    helper = await db.get(Helper, helper_id)
+    helper = await user_repo.get_helper(db, helper_id)
     if helper is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown helper")
     if helper.status is HelperStatus.approved:
         raise HTTPException(status.HTTP_409_CONFLICT, "Helper is already approved")
 
-    user = await db.get(User, helper.user_id)
+    user = await user_repo.get(db, helper.user_id)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Helper has no user row")
 
@@ -179,14 +178,12 @@ async def suspend_user(
     if user_id == admin.user_id:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Cannot suspend yourself")
 
-    user = await db.get(User, user_id)
+    user = await user_repo.get(db, user_id)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown user")
 
     user.status = UserStatus.suspended
-    if (helper := (await db.execute(
-        select(Helper).where(Helper.user_id == user_id)
-    )).scalar_one_or_none()) is not None:
+    if (helper := await user_repo.helper_by_user_id(db, user_id)) is not None:
         helper.status = HelperStatus.suspended
     await db.commit()
 
@@ -213,7 +210,7 @@ async def reinstate_user(
     Only reverses a suspension. An account waiting on its email confirmation or
     on a first approval is not something to skip past — the answer says which.
     """
-    user = await db.get(User, user_id)
+    user = await user_repo.get(db, user_id)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown user")
     if user.status is not UserStatus.suspended:
@@ -222,9 +219,7 @@ async def reinstate_user(
         )
 
     user.status = UserStatus.active
-    helper = (
-        await db.execute(select(Helper).where(Helper.user_id == user_id))
-    ).scalar_one_or_none()
+    helper = await user_repo.helper_by_user_id(db, user_id)
     if helper is not None:
         helper.status = HelperStatus.approved
     await db.commit()
@@ -269,17 +264,7 @@ async def live_fleet(
     """
     now = datetime.now(UTC)
 
-    rows = (
-        await db.execute(
-            select(Trip, Bus, Route, Helper, User)
-            .join(Bus, Bus.id == Trip.bus_id)
-            .join(Route, Route.id == Trip.route_id)
-            .join(Helper, Helper.id == Trip.helper_id)
-            .join(User, User.id == Helper.user_id)
-            .where(Trip.status == TripStatus.live)
-            .order_by(Trip.actual_start)
-        )
-    ).all()
+    rows = await fleet_repo.live_trips_with_context(db)
 
     if not rows:
         return FleetOut(generated_at=now, total=0, live=0, stale=0, lost=0, buses=[])
@@ -368,11 +353,7 @@ async def list_alerts(
     Backed by `ix_alerts_status_severity`, so the default view stays an index
     scan over open rows rather than a sort of the whole table as history grows.
     """
-    stmt = select(Alert)
-    if alert_status is not None:
-        stmt = stmt.where(Alert.status == alert_status)
-    stmt = stmt.order_by(Alert.severity, Alert.created_at.desc()).limit(limit)
-    return list((await db.execute(stmt)).scalars())
+    return await ops_repo.list_alerts(db, alert_status, limit)
 
 
 @router.post("/alerts/{alert_id}/acknowledge", response_model=AlertOut)
@@ -382,7 +363,7 @@ async def acknowledge_alert(
     admin: Principal = Depends(require_admin),
 ) -> Alert:
     """Claim an alert so two admins do not work the same incident."""
-    alert = await db.get(Alert, alert_id)
+    alert = await ops_repo.get_alert(db, alert_id)
     if alert is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown alert")
     if alert.status is not AlertStatus.open:
@@ -402,7 +383,7 @@ async def resolve_alert(
     admin: Principal = Depends(require_admin),
 ) -> Alert:
     """Close an incident. A resolved alert keeps who acknowledged it and why."""
-    alert = await db.get(Alert, alert_id)
+    alert = await ops_repo.get_alert(db, alert_id)
     if alert is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown alert")
     if alert.status in (AlertStatus.resolved, AlertStatus.dismissed):
@@ -428,8 +409,7 @@ async def create_bus(
     db: AsyncSession = Depends(get_db),
 ) -> Bus:
     """Create a new bus in the fleet."""
-    stmt = select(Bus).where(Bus.reg_no == body.reg_no)
-    existing = (await db.execute(stmt)).scalar_one_or_none()
+    existing = await fleet_repo.bus_by_reg_no(db, body.reg_no)
     if existing is not None:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -470,10 +450,7 @@ async def list_fleet_buses(
     operator needs the opposite: the bus in the workshop is exactly the one they
     are looking for.
     """
-    stmt = select(Bus)
-    if bus_status is not None:
-        stmt = stmt.where(Bus.status == bus_status)
-    return list((await db.execute(stmt.order_by(Bus.reg_no))).scalars())
+    return await fleet_repo.list_buses(db, bus_status)
 
 
 @router.patch("/buses/{bus_id}", response_model=BusOut)
@@ -494,7 +471,7 @@ async def update_bus(
     a helper whose app is posting fixes against it; the trip ends normally and the
     bus is simply never offered again.
     """
-    bus = await db.get(Bus, bus_id)
+    bus = await fleet_repo.get_bus(db, bus_id)
     if bus is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown bus")
 
@@ -534,8 +511,7 @@ async def create_bus_list(
             detail=f"Duplicate reg_no in payload: {', '.join(sorted(duplicates))}",
         )
 
-    stmt = select(Bus.reg_no).where(Bus.reg_no.in_(list(seen)))
-    existing_regs = set((await db.execute(stmt)).scalars())
+    existing_regs = await fleet_repo.existing_reg_nos(db, seen)
     if existing_regs:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
