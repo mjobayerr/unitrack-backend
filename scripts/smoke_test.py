@@ -58,8 +58,9 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 def _ws_url(path: str) -> str:
     # http->ws, https->wss (str.replace on the first "http" turns "https" into
-    # "wss" too — the trailing 's' survives).
-    return BASE_URL.replace("http", "ws", 1) + path
+    # "wss" too — the trailing 's' survives). Callers pass the router-relative
+    # path (/ws/track/...); the API version prefix is added here, in one place.
+    return BASE_URL.replace("http", "ws", 1) + "/api/v1" + path
 
 
 def check_live_track_ws(route_id: str, token: str, bus_id: str) -> None:
@@ -108,7 +109,7 @@ def main() -> int:
 
     c = httpx.Client(base_url=BASE_URL, timeout=20.0)
 
-    r = c.post("/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD})
+    r = c.post("/api/v1/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD})
     check("admin login", r.status_code == 200, f"{r.status_code} {r.text[:120]}")
     if r.status_code != 200:
         return 1
@@ -118,7 +119,7 @@ def main() -> int:
     helper_email = f"helper-{uuid.uuid4().hex[:8]}@buscrew.com.bd"
     helper_pw = "HelperPass!2026"
     r = c.post(
-        "/auth/register/helper",
+        "/api/v1/auth/register/helper",
         json={
             "email": helper_email,
             "password": helper_pw,
@@ -128,43 +129,44 @@ def main() -> int:
     )
     check("register helper", r.status_code == 201, f"{r.status_code} {r.text[:160]}")
 
-    r = c.post("/auth/login", json={"email": helper_email, "password": helper_pw})
+    r = c.post("/api/v1/auth/login", json={"email": helper_email, "password": helper_pw})
     check("unapproved helper cannot sign in", r.status_code == 403, f"got {r.status_code}")
 
-    r = c.get("/admin/helpers", params={"helper_status": "pending"}, headers=admin_h)
+    r = c.get("/api/v1/admin/helpers", params={"helper_status": "pending"}, headers=admin_h)
     rows = [h for h in r.json() if h["email"] == helper_email] if r.status_code == 200 else []
     check("new helper is in the approval queue", len(rows) == 1, f"{r.status_code}")
     if not rows:
         return 1
     helper_id, user_id = rows[0]["helper_id"], rows[0]["user_id"]
 
-    r = c.post(f"/admin/helpers/{helper_id}/approve", headers=admin_h)
+    r = c.post(f"/api/v1/admin/helpers/{helper_id}/approve", headers=admin_h)
     check("admin approves helper", r.status_code == 200, f"{r.status_code} {r.text[:160]}")
-    r = c.post(f"/admin/helpers/{helper_id}/approve", headers=admin_h)
+    r = c.post(f"/api/v1/admin/helpers/{helper_id}/approve", headers=admin_h)
     check("re-approving is 409", r.status_code == 409, f"got {r.status_code}")
 
     # Approval invalidated the cached Principal, so this must work immediately.
-    r = c.post("/auth/login", json={"email": helper_email, "password": helper_pw})
+    r = c.post("/api/v1/auth/login", json={"email": helper_email, "password": helper_pw})
     check("approved helper signs in", r.status_code == 200, f"{r.status_code} {r.text[:160]}")
     helper_token = r.json()["access_token"]
     helper_h = {"authorization": f"Bearer {helper_token}"}
 
     check(
         "helper is refused an admin route",
-        c.get("/admin/helpers", headers=helper_h).status_code == 403,
+        c.get("/api/v1/admin/helpers", headers=helper_h).status_code == 403,
     )
     check(
         "unauthenticated tracking is refused",
-        c.get("/track/nearby", params={"lat": 23.78, "lng": 90.40}).status_code in (401, 403),
+        c.get("/api/v1/track/nearby", params={"lat": 23.78, "lng": 90.40}).status_code
+        in (401, 403),
     )
 
-    r = c.get("/fleet/buses", headers=helper_h)
+    r = c.get("/api/v1/fleet/buses", headers=helper_h)
     check("fleet buses", r.status_code == 200 and r.json(), f"{r.status_code} — seed a bus first?")
     if r.status_code != 200 or not r.json():
         return 1
     bus = r.json()[0]
 
-    r = c.get("/fleet/routes", headers=helper_h)
+    r = c.get("/api/v1/fleet/routes", headers=helper_h)
     check(
         "fleet routes",
         r.status_code == 200 and r.json(),
@@ -174,7 +176,7 @@ def main() -> int:
         return 1
     route = r.json()[0]
 
-    r = c.get(f"/fleet/routes/{route['id']}", headers=helper_h)
+    r = c.get(f"/api/v1/fleet/routes/{route['id']}", headers=helper_h)
     check(
         "route detail carries ordered stops",
         r.status_code == 200 and len(r.json().get("stops", [])) > 0,
@@ -183,19 +185,19 @@ def main() -> int:
 
     check(
         "seats without a trip is 409",
-        c.post("/helper/seats", json={"occupied": 10}, headers=helper_h).status_code == 409,
+        c.post("/api/v1/helper/seats", json={"occupied": 10}, headers=helper_h).status_code == 409,
     )
 
     # An alert must never be refused for want of a trip — see routes/helper.py.
-    r = c.post("/helper/alerts", json={"type": "breakdown"}, headers=helper_h)
+    r = c.post("/api/v1/helper/alerts", json={"type": "breakdown"}, headers=helper_h)
     check("alert without a trip is allowed", r.status_code == 201, f"{r.status_code}")
     check("severity is assigned by the server", r.json().get("severity") == "critical")
 
-    r = c.get("/helper/trips/active", headers=helper_h)
+    r = c.get("/api/v1/helper/trips/active", headers=helper_h)
     check("no active trip initially", r.status_code == 200 and r.json() is None, f"{r.status_code}")
 
     r = c.post(
-        "/helper/trips/start",
+        "/api/v1/helper/trips/start",
         json={"bus_id": bus["id"], "route_id": route["id"]},
         headers=helper_h,
     )
@@ -203,13 +205,13 @@ def main() -> int:
     trip = r.json()
 
     r = c.post(
-        "/helper/trips/start",
+        "/api/v1/helper/trips/start",
         json={"bus_id": bus["id"], "route_id": route["id"]},
         headers=helper_h,
     )
     check("double start is refused by the partial unique index", r.status_code == 409)
 
-    r = c.get("/helper/trips/active", headers=helper_h)
+    r = c.get("/api/v1/helper/trips/active", headers=helper_h)
     check(
         "active trip is returned",
         r.status_code == 200 and r.json() and r.json()["trip_id"] == trip["id"],
@@ -217,7 +219,7 @@ def main() -> int:
     )
 
     r = c.post(
-        "/helper/gps",
+        "/api/v1/helper/gps",
         json={
             "bus_id": bus["id"],
             "points": [
@@ -231,7 +233,7 @@ def main() -> int:
     check("fixes are bound to the trip", r.json().get("trip_id") == trip["id"])
 
     r = c.post(
-        "/helper/gps",
+        "/api/v1/helper/gps",
         json={
             "bus_id": str(uuid.uuid4()),
             "points": [{"lat": 23.7, "lng": 90.4, "ts": "2026-07-23T09:00:10Z"}],
@@ -240,7 +242,7 @@ def main() -> int:
     )
     check("gps for another bus is refused", r.status_code == 409, f"got {r.status_code}")
 
-    r = c.post("/helper/seats", json={"occupied": 42}, headers=helper_h)
+    r = c.post("/api/v1/helper/seats", json={"occupied": 42}, headers=helper_h)
     check("seat report", r.status_code == 201, f"{r.status_code} {r.text[:200]}")
     seats = r.json()
     check(
@@ -250,7 +252,7 @@ def main() -> int:
     )
     check(
         "an absurd count is rejected",
-        c.post("/helper/seats", json={"occupied": 999}, headers=helper_h).status_code == 422,
+        c.post("/api/v1/helper/seats", json={"occupied": 999}, headers=helper_h).status_code == 422,
     )
 
     # Trip is live and its position is in Redis — the moment the live map has
@@ -258,25 +260,29 @@ def main() -> int:
     # is on it.
     check_live_track_ws(route["id"], helper_token, bus["id"])
 
-    r = c.post("/helper/alerts", json={"type": "sos", "lat": 23.75, "lng": 90.37}, headers=helper_h)
+    r = c.post(
+        "/api/v1/helper/alerts",
+        json={"type": "sos", "lat": 23.75, "lng": 90.37},
+        headers=helper_h,
+    )
     check("sos alert", r.status_code == 201, f"{r.status_code}")
     check("sos is bound to the trip", r.json().get("trip_id") == trip["id"])
     alert_id = r.json()["id"]
 
-    r = c.get("/admin/alerts", headers=admin_h)
+    r = c.get("/api/v1/admin/alerts", headers=admin_h)
     check("admin console lists open alerts", r.status_code == 200 and r.json(), f"{r.status_code}")
     check("critical sorts first", r.json()[0]["severity"] == "critical")
 
-    r = c.post(f"/admin/alerts/{alert_id}/acknowledge", headers=admin_h)
+    r = c.post(f"/api/v1/admin/alerts/{alert_id}/acknowledge", headers=admin_h)
     check("acknowledge", r.status_code == 200 and r.json()["status"] == "acknowledged")
     r = c.post(
-        f"/admin/alerts/{alert_id}/resolve",
+        f"/api/v1/admin/alerts/{alert_id}/resolve",
         json={"note": "Closed by smoke test"},
         headers=admin_h,
     )
     check("resolve", r.status_code == 200 and r.json()["status"] == "resolved")
 
-    r = c.post("/helper/trips/end", headers=helper_h)
+    r = c.post("/api/v1/helper/trips/end", headers=helper_h)
     check(
         "end trip",
         r.status_code == 200 and r.json()["status"] == "completed",
@@ -284,7 +290,7 @@ def main() -> int:
     )
     check(
         "ending twice is 409",
-        c.post("/helper/trips/end", headers=helper_h).status_code == 409,
+        c.post("/api/v1/helper/trips/end", headers=helper_h).status_code == 409,
     )
 
     print("      (waiting for the worker to index into Elasticsearch...)")
@@ -292,7 +298,7 @@ def main() -> int:
     for _ in range(INDEX_TIMEOUT_S):
         time.sleep(1)
         r = c.get(
-            "/track/nearby",
+            "/api/v1/track/nearby",
             params={"lat": 23.7561, "lng": 90.3720, "radius_km": 5},
             headers=helper_h,
         )
@@ -307,9 +313,9 @@ def main() -> int:
 
     # The whole point of invalidate_principal(): revocation on the next request,
     # not whenever the cache happens to expire.
-    r = c.post(f"/admin/users/{user_id}/suspend", headers=admin_h)
+    r = c.post(f"/api/v1/admin/users/{user_id}/suspend", headers=admin_h)
     check("suspend the helper", r.status_code == 204, f"got {r.status_code}")
-    r = c.get("/fleet/buses", headers=helper_h)
+    r = c.get("/api/v1/fleet/buses", headers=helper_h)
     check("suspended account is refused immediately", r.status_code == 401, f"got {r.status_code}")
 
     print(f"\n{len(passed)} passed, {len(failed)} failed")

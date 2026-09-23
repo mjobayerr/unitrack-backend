@@ -119,13 +119,13 @@ async def client(db, verify_sent, reset_sent):
 async def _register_active(client, verify_sent) -> None:
     """A registered, email-confirmed student — the normal state of an account
     whose owner then forgets the password."""
-    await client.post("/auth/register/student", json=REGISTRATION)
-    await client.get("/auth/verify-email", params={"token": verify_sent[0]["token"]})
+    await client.post("/api/v1/auth/register/student", json=REGISTRATION)
+    await client.get("/api/v1/auth/verify-email", params={"token": verify_sent[0]["token"]})
 
 
 async def _login(client, password: str):
     return await client.post(
-        "/auth/login", json={"email": REGISTRATION["email"], "password": password}
+        "/api/v1/auth/login", json={"email": REGISTRATION["email"], "password": password}
     )
 
 
@@ -137,12 +137,12 @@ async def test_reset_changes_the_password_and_old_one_stops_working(
 ) -> None:
     await _register_active(client, verify_sent)
 
-    asked = await client.post("/auth/forgot-password", json={"email": REGISTRATION["email"]})
+    asked = await client.post("/api/v1/auth/forgot-password", json={"email": REGISTRATION["email"]})
     assert asked.status_code == status.HTTP_202_ACCEPTED
     assert len(reset_sent) == 1
 
     reset = await client.post(
-        "/auth/reset-password",
+        "/api/v1/auth/reset-password",
         json={"token": reset_sent[0]["token"], "password": NEW_PASSWORD},
     )
     assert reset.status_code == status.HTTP_204_NO_CONTENT
@@ -163,8 +163,8 @@ async def test_forgot_answers_identically_for_a_missing_address(
     await _register_active(client, verify_sent)
     reset_sent.clear()
 
-    real = await client.post("/auth/forgot-password", json={"email": REGISTRATION["email"]})
-    fake = await client.post("/auth/forgot-password", json={"email": "nobody@ulab.edu.bd"})
+    real = await client.post("/api/v1/auth/forgot-password", json={"email": REGISTRATION["email"]})
+    fake = await client.post("/api/v1/auth/forgot-password", json={"email": "nobody@ulab.edu.bd"})
 
     assert real.status_code == fake.status_code == status.HTTP_202_ACCEPTED
     assert real.json() == fake.json()
@@ -199,7 +199,7 @@ async def test_a_forged_wrong_type_or_expired_token_is_refused(client, verify_se
     ]
     for token in bad_tokens:
         response = await client.post(
-            "/auth/reset-password", json={"token": token, "password": NEW_PASSWORD}
+            "/api/v1/auth/reset-password", json={"token": token, "password": NEW_PASSWORD}
         )
         assert response.status_code == status.HTTP_400_BAD_REQUEST, token
 
@@ -211,14 +211,14 @@ async def test_a_reset_token_is_single_use(client, verify_sent, reset_sent) -> N
     """A link that leaks from an inbox or a mail log must not be replayable to
     change the password a second time."""
     await _register_active(client, verify_sent)
-    await client.post("/auth/forgot-password", json={"email": REGISTRATION["email"]})
+    await client.post("/api/v1/auth/forgot-password", json={"email": REGISTRATION["email"]})
     token = reset_sent[0]["token"]
 
     first = await client.post(
-        "/auth/reset-password", json={"token": token, "password": NEW_PASSWORD}
+        "/api/v1/auth/reset-password", json={"token": token, "password": NEW_PASSWORD}
     )
     second = await client.post(
-        "/auth/reset-password", json={"token": token, "password": "yet another password"}
+        "/api/v1/auth/reset-password", json={"token": token, "password": "yet another password"}
     )
     assert first.status_code == status.HTTP_204_NO_CONTENT
     assert second.status_code == status.HTTP_400_BAD_REQUEST
@@ -229,10 +229,10 @@ async def test_a_reset_token_is_single_use(client, verify_sent, reset_sent) -> N
 
 async def test_a_short_new_password_is_refused(client, verify_sent, reset_sent) -> None:
     await _register_active(client, verify_sent)
-    await client.post("/auth/forgot-password", json={"email": REGISTRATION["email"]})
+    await client.post("/api/v1/auth/forgot-password", json={"email": REGISTRATION["email"]})
 
     response = await client.post(
-        "/auth/reset-password", json={"token": reset_sent[0]["token"], "password": "short"}
+        "/api/v1/auth/reset-password", json={"token": reset_sent[0]["token"], "password": "short"}
     )
     assert response.status_code == 422
 

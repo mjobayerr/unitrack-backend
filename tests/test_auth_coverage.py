@@ -31,8 +31,19 @@ except Exception:  # pragma: no cover - fallback for editor/language-server
             pass
 
 from app.api.deps import get_access_claims
-from app.api.routes import PUBLIC_PATHS, ROUTERS
+from app.api.routes import API_V1_PREFIX, PUBLIC_PATHS, ROUTERS
 from app.main import create_app
+
+
+def _logical(path: str) -> str:
+    """The path as PUBLIC_PATHS lists it: the mount version prefix stripped off.
+
+    openapi.json reports the real served paths (`/api/v1/auth/login`), while
+    PUBLIC_PATHS holds the logical ones (`/auth/login`). `/health` and the docs
+    routes are mounted outside the versioned router, carry no prefix, and pass
+    through unchanged.
+    """
+    return path[len(API_V1_PREFIX) :] if path.startswith(API_V1_PREFIX) else path
 
 
 def _resolves(dependant: Dependant, target) -> bool:
@@ -97,7 +108,7 @@ def test_guarded_routes_declare_bearer_auth_in_openapi() -> None:
     missing = [
         f"{method.upper()} {path}"
         for path, ops in schema["paths"].items()
-        if path not in PUBLIC_PATHS
+        if _logical(path) not in PUBLIC_PATHS
         for method, op in ops.items()
         if method in {"get", "post", "put", "patch", "delete"} and not op.get("security")
     ]
