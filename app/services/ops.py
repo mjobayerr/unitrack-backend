@@ -1,4 +1,11 @@
-"""Seat reports and alerts — the two things the helper reports by hand."""
+"""Seat reports and alerts — the two things the helper reports by hand.
+
+Transaction contract (see app/services/__init__.py): the write functions here
+**flush but do not commit** — the route owns the transaction. Pushing the live
+value to Redis (the seats hash, the alert fan-out) is a *post-commit* step, done
+by the route via `publish_seats` / `publish_alert` after its `commit()`, so the
+console never sees a number the database has not durably recorded.
+"""
 
 from __future__ import annotations
 
@@ -36,7 +43,6 @@ def severity_for(alert_type: AlertType) -> AlertSeverity:
 
 async def report_seats(
     db: AsyncSession,
-    r: Redis,
     *,
     trip_id: uuid.UUID,
     helper_id: uuid.UUID,
@@ -44,7 +50,8 @@ async def report_seats(
     occupied: int,
     reported_at: datetime.datetime | None,
 ) -> SeatReport:
-    """Append an occupancy count and refresh the live value."""
+    """Append an occupancy count. Flushes; the caller commits and then publishes
+    the live value via `publish_seats`."""
     report = SeatReport(
         trip_id=trip_id,
         helper_id=helper_id,
@@ -53,8 +60,19 @@ async def report_seats(
         reported_at=reported_at or datetime.datetime.now(datetime.UTC),
     )
     db.add(report)
-    await db.commit()
+    await db.flush()
+    return report
 
+
+async def publish_seats(
+    r: Redis,
+    *,
+    bus: Bus,
+    trip_id: uuid.UUID,
+    occupied: int,
+    reported_at: datetime.datetime,
+) -> None:
+    """Refresh the bus's live seats hash for the fleet map. Post-commit."""
     key = bus_seats_key(str(bus.id))
     pipe = r.pipeline(transaction=False)
     pipe.hset(
@@ -63,17 +81,15 @@ async def report_seats(
             "occupied": str(occupied),
             "capacity": str(bus.capacity),
             "trip_id": str(trip_id),
-            "ts": report.reported_at.astimezone(datetime.UTC).isoformat(),
+            "ts": reported_at.astimezone(datetime.UTC).isoformat(),
         },
     )
     pipe.expire(key, SEATS_TTL_S)
     await pipe.execute()
-    return report
 
 
 async def raise_alert(
     db: AsyncSession,
-    r: Redis,
     *,
     source: AlertSource,
     alert_type: AlertType,
@@ -84,10 +100,11 @@ async def raise_alert(
     lat: float | None,
     lng: float | None,
 ) -> Alert:
-    """Record an alert and push it to the admin console.
+    """Record an alert. Flushes; the caller commits and then pushes it to the
+    console via `publish_alert`.
 
-    The database write happens first and the publish second: a dropped pub/sub
-    message costs a console refresh, whereas a lost row loses the incident.
+    The row is made durable before the publish: a dropped pub/sub message costs
+    a console refresh, whereas a lost row loses the incident.
     """
     alert = Alert(
         source=source,
@@ -101,8 +118,20 @@ async def raise_alert(
         lng=lng,
     )
     db.add(alert)
-    await db.commit()
+    await db.flush()
+    return alert
 
+
+async def publish_alert(
+    r: Redis,
+    alert: Alert,
+    *,
+    bus_id: uuid.UUID | None,
+    trip_id: uuid.UUID | None,
+    lat: float | None,
+    lng: float | None,
+) -> None:
+    """Fan a recorded alert out to the admin console. Post-commit, best-effort."""
     try:
         await r.publish(
             alerts_channel(),
@@ -120,4 +149,3 @@ async def raise_alert(
         )
     except Exception:  # noqa: BLE001 — the incident is already durable
         pass
-    return alert

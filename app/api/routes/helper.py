@@ -16,8 +16,8 @@ from app.api.deps import require_approved_helper
 from app.core.authz import Principal
 from app.core.redis import GPS_STREAM, bus_pos_key, fleet_channel, get_redis
 from app.db.session import get_db
-from app.models.fleet import Bus
 from app.models.ops import AlertSource
+from app.repositories import fleet as fleet_repo
 from app.schemas.gps import GpsAccepted, GpsBatch
 from app.schemas.ops import AlertOut, AlertRaiseIn, SeatReportIn, SeatStateOut
 from app.schemas.trip import ActiveTripOut, TripOut, TripStartRequest
@@ -46,12 +46,14 @@ async def start_trip(
     """Begin a trip. Everything the bus produces from now on binds to it."""
     try:
         trip = await trip_service.start_trip(
-            db, r, helper_id=helper.helper_id, bus_id=body.bus_id, route_id=body.route_id
+            db, helper_id=helper.helper_id, bus_id=body.bus_id, route_id=body.route_id
         )
     except trip_service.InvalidTripTargetError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except trip_service.TripConflictError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    await db.commit()
+    await trip_service.cache_active_trip(r, trip)
     return TripOut.model_validate(trip)
 
 
@@ -68,9 +70,11 @@ async def end_trip(
     client to get wrong or forge.
     """
     try:
-        trip = await trip_service.end_trip(db, r, helper_id=helper.helper_id)
+        trip = await trip_service.end_trip(db, helper_id=helper.helper_id)
     except trip_service.TripNotFoundError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    await db.commit()
+    await trip_service.clear_active_trip(r, helper.helper_id)
     return TripOut.model_validate(trip)
 
 
@@ -114,18 +118,25 @@ async def report_seats(
     if active is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "Start a trip before reporting seats")
 
-    bus = await db.get(Bus, active.bus_id)
+    bus = await fleet_repo.get_bus(db, active.bus_id)
     if bus is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown bus")
 
     report = await ops_service.report_seats(
         db,
-        r,
         trip_id=active.trip_id,
         helper_id=helper.helper_id,
         bus=bus,
         occupied=body.occupied,
         reported_at=body.reported_at,
+    )
+    await db.commit()
+    await ops_service.publish_seats(
+        r,
+        bus=bus,
+        trip_id=active.trip_id,
+        occupied=report.occupied,
+        reported_at=report.reported_at,
     )
     return SeatStateOut(
         trip_id=active.trip_id,
@@ -156,13 +167,21 @@ async def raise_alert(
     active = await trip_service.get_active_trip(db, r, helper.helper_id)
     alert = await ops_service.raise_alert(
         db,
-        r,
         source=AlertSource.helper,
         alert_type=body.type,
         raised_by=helper.user_id,
         trip_id=active.trip_id if active else None,
         bus_id=active.bus_id if active else None,
         message=body.message,
+        lat=body.lat,
+        lng=body.lng,
+    )
+    await db.commit()
+    await ops_service.publish_alert(
+        r,
+        alert,
+        bus_id=active.bus_id if active else None,
+        trip_id=active.trip_id if active else None,
         lat=body.lat,
         lng=body.lng,
     )
@@ -229,7 +248,7 @@ async def ingest_gps(
             # this helper's to report on. Telling them apart is not a leak — a
             # helper can already list the fleet — and "unknown bus" sent someone
             # hunting for a data problem that was not there.
-            if await db.get(Bus, batch.bus_id) is None:
+            if await fleet_repo.get_bus(db, batch.bus_id) is None:
                 raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown bus")
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
