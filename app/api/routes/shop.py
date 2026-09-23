@@ -24,17 +24,17 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
-from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import require_authenticated, require_student
-from app.core.authz import Principal
-from app.core.config import settings
+from app.api.deps import get_current_student, require_authenticated
+from app.core.config import API_V1_PREFIX, settings
 from app.core.sslcommerz import GatewayError, SslCommerzClient
 from app.db.session import get_db
 from app.models.commerce import Order, OrderStatus, Ticket, TicketProduct
-from app.models.user import Student, User
+from app.models.user import Student
+from app.repositories import commerce as commerce_repo
+from app.repositories import users as user_repo
 from app.schemas.commerce import CheckoutOut, OrderCreate, OrderOut, ProductOut, TicketOut
 from app.services.settlement import AMOUNT_MISMATCH, PAID, apply_validation
 
@@ -42,29 +42,26 @@ logger = logging.getLogger("unitrack.shop")
 
 router = APIRouter(prefix="/shop", tags=["shop"])
 
+# One shared client, handed to handlers through a dependency rather than reached
+# as a module global. The default is this instance; a test overrides `get_gateway`
+# to stand in a fake, and nothing has to monkeypatch a module attribute to do it.
 _gateway = SslCommerzClient()
 
 
-async def _student_for(db: AsyncSession, principal: Principal) -> Student:
-    student = (
-        await db.execute(select(Student).where(Student.user_id == principal.user_id))
-    ).scalar_one_or_none()
-    if student is None:
-        # A student-role account with no student row is a data fault, not a
-        # permission problem; saying "forbidden" would send someone hunting in
-        # the wrong place.
-        raise HTTPException(status.HTTP_409_CONFLICT, "Account has no student profile")
-    return student
+def get_gateway() -> SslCommerzClient:
+    return _gateway
 
 
 def _return_urls() -> dict[str, str]:
     base = settings.public_base_url.rstrip("/")
     # One endpoint for all three outcomes: the gateway tells us which happened,
-    # and three near-identical handlers would drift apart.
+    # and three near-identical handlers would drift apart. Built with the version
+    # prefix — the gateway must be handed the real served path, or the browser
+    # comes back to a 404 and the ticket is never issued.
     return {
-        "success_url": f"{base}/shop/payments/return",
-        "fail_url": f"{base}/shop/payments/return",
-        "cancel_url": f"{base}/shop/payments/return",
+        "success_url": f"{base}{API_V1_PREFIX}/shop/payments/return",
+        "fail_url": f"{base}{API_V1_PREFIX}/shop/payments/return",
+        "cancel_url": f"{base}{API_V1_PREFIX}/shop/payments/return",
     }
 
 
@@ -78,7 +75,7 @@ def _ipn_url() -> str | None:
     base = settings.public_base_url.rstrip("/")
     if "localhost" in base or "127.0.0.1" in base:
         return None
-    return f"{base}/shop/payments/ipn"
+    return f"{base}{API_V1_PREFIX}/shop/payments/ipn"
 
 
 # ---------------------------------------------------------------------------
@@ -94,10 +91,7 @@ def _ipn_url() -> str | None:
 async def list_products(db: AsyncSession = Depends(get_db)) -> list[TicketProduct]:
     """What is for sale. Readable by any signed-in account so the helper app can
     show a student what they should have bought."""
-    stmt = select(TicketProduct).where(TicketProduct.active.is_(True)).order_by(
-        TicketProduct.price_paisa
-    )
-    return list((await db.execute(stmt)).scalars())
+    return await commerce_repo.list_products(db, active_only=True)
 
 
 # ---------------------------------------------------------------------------
@@ -108,8 +102,9 @@ async def list_products(db: AsyncSession = Depends(get_db)) -> list[TicketProduc
 @router.post("/orders", response_model=CheckoutOut, status_code=status.HTTP_201_CREATED)
 async def create_order(
     payload: OrderCreate,
-    principal: Principal = Depends(require_student),
+    student: Student = Depends(get_current_student),
     db: AsyncSession = Depends(get_db),
+    gateway: SslCommerzClient = Depends(get_gateway),
 ) -> CheckoutOut:
     """Start a purchase and return the gateway URL to send the student to.
 
@@ -118,20 +113,16 @@ async def create_order(
     the database, because a check-then-insert loses the race that makes this
     necessary in the first place.
     """
-    student = await _student_for(db, principal)
-
-    existing = (
-        await db.execute(select(Order).where(Order.idempotency_key == payload.idempotency_key))
-    ).scalar_one_or_none()
+    existing = await commerce_repo.order_by_idempotency_key(db, payload.idempotency_key)
     if existing is not None:
         if existing.student_id != student.id:
             # Someone else's key. Refuse rather than reveal that it exists.
             raise HTTPException(status.HTTP_409_CONFLICT, "Idempotency key already used")
         if existing.status is OrderStatus.paid:
             raise HTTPException(status.HTTP_409_CONFLICT, "Order already paid")
-        return await _open_checkout(db, existing, student)
+        return await _open_checkout(db, gateway, existing, student)
 
-    product = await db.get(TicketProduct, payload.product_id)
+    product = await commerce_repo.get_product(db, payload.product_id)
     if product is None or not product.active:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Product not available")
 
@@ -153,23 +144,23 @@ async def create_order(
         # Lost the race against a concurrent identical request; that request's
         # order is the real one.
         await db.rollback()
-        winner = (
-            await db.execute(select(Order).where(Order.idempotency_key == payload.idempotency_key))
-        ).scalar_one()
-        return await _open_checkout(db, winner, student)
+        winner = await commerce_repo.order_by_idempotency_key(db, payload.idempotency_key)
+        return await _open_checkout(db, gateway, winner, student)
 
     await db.refresh(order)
-    return await _open_checkout(db, order, student)
+    return await _open_checkout(db, gateway, order, student)
 
 
-async def _open_checkout(db: AsyncSession, order: Order, student: Student) -> CheckoutOut:
-    product = await db.get(TicketProduct, order.product_id)
-    user = await db.get(User, student.user_id)
+async def _open_checkout(
+    db: AsyncSession, gateway: SslCommerzClient, order: Order, student: Student
+) -> CheckoutOut:
+    product = await commerce_repo.get_product(db, order.product_id)
+    user = await user_repo.get(db, student.user_id)
     if product is None or user is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "Order references missing records")
 
     try:
-        checkout_url = await _gateway.create_session(
+        checkout_url = await gateway.create_session(
             tran_id=order.tran_id,
             amount_paisa=order.amount_paisa,
             currency=order.currency,
@@ -213,7 +204,7 @@ class SettlementError(Exception):
         self.detail = detail
 
 
-async def _settle(db: AsyncSession, fields: dict) -> tuple[Order, str]:
+async def _settle(db: AsyncSession, gateway: SslCommerzClient, fields: dict) -> tuple[Order, str]:
     """Decide what happened to one payment, and issue a ticket if it succeeded.
 
     Shared by the browser return and the IPN, because those are two reports of
@@ -227,7 +218,7 @@ async def _settle(db: AsyncSession, fields: dict) -> tuple[Order, str]:
     if not tran_id:
         raise SettlementError(status.HTTP_400_BAD_REQUEST, "Missing tran_id")
 
-    order = (await db.execute(select(Order).where(Order.tran_id == tran_id))).scalar_one_or_none()
+    order = await commerce_repo.order_by_tran_id(db, tran_id)
     if order is None:
         raise SettlementError(status.HTTP_404_NOT_FOUND, "Unknown transaction")
 
@@ -249,7 +240,7 @@ async def _settle(db: AsyncSession, fields: dict) -> tuple[Order, str]:
         raise SettlementError(status.HTTP_400_BAD_REQUEST, "Missing val_id")
 
     try:
-        validation = await _gateway.validate(val_id)
+        validation = await gateway.validate(val_id)
     except GatewayError as exc:
         # Leave the order pending rather than failing it: the money may well
         # have moved, and the reconciler needs to see it as unsettled.
@@ -284,14 +275,14 @@ async def _settle(db: AsyncSession, fields: dict) -> tuple[Order, str]:
     return order, outcome
 
 
-async def _handle_return(db: AsyncSession, fields: dict):
+async def _handle_return(db: AsyncSession, gateway: SslCommerzClient, fields: dict):
     """Where the gateway sends the student's browser, whatever the outcome.
 
     Unauthenticated by necessity and safe by construction — see the module
     docstring. This is the fast path; the IPN below is the reliable one.
     """
     try:
-        order, outcome = await _settle(db, fields)
+        order, outcome = await _settle(db, gateway, fields)
     except SettlementError as exc:
         raise HTTPException(exc.status_code, exc.detail) from exc
     return _finish(order, outcome)
@@ -302,19 +293,31 @@ async def _handle_return(db: AsyncSession, fields: dict):
 # methods emits duplicates — which makes the generated TypeScript client in
 # unitrack-web collide on one of them.
 @router.post("/payments/return", operation_id="payment_return_post")
-async def payment_return_post(request: Request, db: AsyncSession = Depends(get_db)):
+async def payment_return_post(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    gateway: SslCommerzClient = Depends(get_gateway),
+):
     """The normal case: SSLCommerz returns the student with a form POST."""
-    return await _handle_return(db, dict(await request.form()))
+    return await _handle_return(db, gateway, dict(await request.form()))
 
 
 @router.get("/payments/return", operation_id="payment_return_get")
-async def payment_return_get(request: Request, db: AsyncSession = Depends(get_db)):
+async def payment_return_get(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    gateway: SslCommerzClient = Depends(get_gateway),
+):
     """Some gateway configurations redirect with a GET and query parameters."""
-    return await _handle_return(db, dict(request.query_params))
+    return await _handle_return(db, gateway, dict(request.query_params))
 
 
 @router.post("/payments/ipn")
-async def payment_ipn(request: Request, db: AsyncSession = Depends(get_db)):
+async def payment_ipn(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    gateway: SslCommerzClient = Depends(get_gateway),
+):
     """SSLCommerz reporting the outcome server to server.
 
     This exists because the browser return cannot be relied on: a student who
@@ -329,7 +332,7 @@ async def payment_ipn(request: Request, db: AsyncSession = Depends(get_db)):
     """
     fields = dict(await request.form())
     try:
-        _order, outcome = await _settle(db, fields)
+        _order, outcome = await _settle(db, gateway, fields)
     except SettlementError as exc:
         if exc.status_code >= 500:
             raise HTTPException(exc.status_code, exc.detail) from exc
@@ -356,25 +359,17 @@ def _finish(order: Order, outcome: str):
 
 @router.get("/orders", response_model=list[OrderOut])
 async def list_orders(
-    principal: Principal = Depends(require_student),
+    student: Student = Depends(get_current_student),
     db: AsyncSession = Depends(get_db),
 ) -> list[Order]:
-    student = await _student_for(db, principal)
-    stmt = (
-        select(Order).where(Order.student_id == student.id).order_by(Order.created_at.desc())
-    )
-    return list((await db.execute(stmt)).scalars())
+    return await commerce_repo.orders_for_student(db, student.id)
 
 
 @router.get("/tickets", response_model=list[TicketOut])
 async def list_tickets(
-    principal: Principal = Depends(require_student),
+    student: Student = Depends(get_current_student),
     db: AsyncSession = Depends(get_db),
 ) -> list[Ticket]:
     """The student's wallet. Scoped to the caller — never takes an id from the
     request, so one student cannot read another's tickets."""
-    student = await _student_for(db, principal)
-    stmt = (
-        select(Ticket).where(Ticket.student_id == student.id).order_by(Ticket.created_at.desc())
-    )
-    return list((await db.execute(stmt)).scalars())
+    return await commerce_repo.tickets_for_student(db, student.id)

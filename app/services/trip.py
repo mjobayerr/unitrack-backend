@@ -3,6 +3,14 @@
 Every GPS fix, redemption and seat report hangs off a trip (spec §6), so this
 module sits on the hottest path in the API. `get_active_trip` is designed to
 answer from Redis alone.
+
+Transaction contract (see app/services/__init__.py). `start_trip` and `end_trip`
+**flush but do not commit** — the route owns the transaction, the same rule the
+settlement and redemption services already follow, so no service silently
+commits a caller's other pending work. Warming and clearing the active-trip
+cache is a *post-commit* step: the route calls `cache_active_trip` /
+`clear_active_trip` after its `commit()`, so nothing is cached before the trip
+is durable and a finished trip's cache is dropped only once the end is real.
 """
 
 from __future__ import annotations
@@ -66,9 +74,13 @@ def service_date_now() -> datetime.date:
 
 
 async def start_trip(
-    db: AsyncSession, r: Redis, *, helper_id: uuid.UUID, bus_id: uuid.UUID, route_id: uuid.UUID
+    db: AsyncSession, *, helper_id: uuid.UUID, bus_id: uuid.UUID, route_id: uuid.UUID
 ) -> Trip:
-    """Put a helper on the road. Raises on a bad target or a double-start."""
+    """Put a helper on the road. Raises on a bad target or a double-start.
+
+    Flushes but does not commit; the caller commits and then warms the cache via
+    `cache_active_trip`.
+    """
     bus = await db.get(Bus, bus_id)
     if bus is None or bus.status is not BusStatus.active:
         raise InvalidTripTargetError("Bus is unknown or not in service")
@@ -87,31 +99,47 @@ async def start_trip(
     )
     db.add(trip)
     try:
-        await db.commit()
+        # flush, not commit: the INSERT reaches the database — so the partial
+        # unique indexes still fire — while the transaction stays the caller's
+        # to commit. Letting the database decide makes a double-tap of Start a
+        # clean 409 instead of two trips racing through a Python check.
+        await db.flush()
     except IntegrityError as exc:
-        # One of the partial unique indexes fired: this bus or this helper is
-        # already live. Letting the database decide makes a double-tap of Start
-        # a clean 409 instead of two trips racing through a Python check.
+        # This bus or this helper is already live. Roll back the failed INSERT so
+        # the caller's session is clean; the route turns this into a 409.
         await db.rollback()
         raise TripConflictError("Bus or helper is already on a live trip") from exc
 
-    await _cache_active(r, helper_id, ActiveTrip.from_model(trip))
     return trip
 
 
-async def end_trip(db: AsyncSession, r: Redis, *, helper_id: uuid.UUID) -> Trip:
+async def cache_active_trip(r: Redis, trip: Trip) -> None:
+    """Warm the active-trip cache. A post-commit step, so the cache never names a
+    trip the transaction has not made durable."""
+    await _cache_active(r, trip.helper_id, ActiveTrip.from_model(trip))
+
+
+async def end_trip(db: AsyncSession, *, helper_id: uuid.UUID) -> Trip:
     """Close the helper's live trip. Idempotent from the caller's view: ending a
-    trip that is already ended raises, so the client can treat it as done."""
+    trip that is already ended raises, so the client can treat it as done.
+
+    Flushes but does not commit; the caller commits and then drops the cache via
+    `clear_active_trip`.
+    """
     trip = await _live_trip_from_db(db, helper_id)
     if trip is None:
         raise TripNotFoundError("No live trip for this helper")
 
     trip.status = TripStatus.completed
     trip.actual_end = datetime.datetime.now(datetime.UTC)
-    await db.commit()
-
-    await r.delete(helper_trip_key(str(helper_id)))
+    await db.flush()
     return trip
+
+
+async def clear_active_trip(r: Redis, helper_id: uuid.UUID) -> None:
+    """Drop the active-trip cache. A post-commit step: run only once the end is
+    committed, so a finished trip stops binding a draining outbox's fixes."""
+    await r.delete(helper_trip_key(str(helper_id)))
 
 
 async def get_active_trip(db: AsyncSession, r: Redis, helper_id: uuid.UUID) -> ActiveTrip | None:
