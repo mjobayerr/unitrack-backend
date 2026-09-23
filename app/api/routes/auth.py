@@ -4,7 +4,6 @@ import uuid
 import jwt
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from redis.asyncio import Redis
-from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,6 +30,7 @@ from app.core.security import (
 )
 from app.db.session import get_db
 from app.models.user import Helper, HelperStatus, Student, User, UserRole, UserStatus
+from app.repositories import users as user_repo
 from app.schemas.auth import (
     ForgotPassword,
     HelperRegister,
@@ -84,11 +84,6 @@ def _email_domain(email: str) -> str:
     return email.rsplit("@", 1)[-1].lower()
 
 
-async def _get_user_by_email(db: AsyncSession, email: str) -> User | None:
-    result = await db.execute(select(User).where(User.email == email.lower()))
-    return result.scalar_one_or_none()
-
-
 @router.post("/register/student", response_model=UserOut, status_code=status.HTTP_201_CREATED)
 async def register_student(
     payload: StudentRegister,
@@ -101,19 +96,14 @@ async def register_student(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Email domain not allowed for student registration",
         )
-    if await _get_user_by_email(db, payload.email):
+    if await user_repo.by_email(db, payload.email):
         raise _EMAIL_TAKEN
 
     # `students.student_id_no` is unique, and a clash is ordinary: two people
     # mistype the same roll number, or someone registers with a classmate's.
     # Unchecked it reached the database as an IntegrityError and answered 500,
     # which tells the student nothing about what to correct.
-    taken = (
-        await db.execute(
-            select(Student.id).where(Student.student_id_no == payload.student_id_no)
-        )
-    ).scalar_one_or_none()
-    if taken is not None:
+    if await user_repo.student_id_taken(db, payload.student_id_no):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="That student ID is already registered",
@@ -185,7 +175,7 @@ async def resend_verification(
     many machines ask. A rejected resend still answers 202 — telling the caller
     they were throttled would confirm the address is real.
     """
-    user = await _get_user_by_email(db, payload.email)
+    user = await user_repo.by_email(db, payload.email)
     if user is not None and user.status is UserStatus.pending_email:
         if await _claim_resend(r, user.email):
             background.add_task(
@@ -244,7 +234,7 @@ async def forgot_password(
     The link is only ever mailed to the address on file, so a stranger asking to
     reset someone else's password just sends that person a link they can ignore.
     """
-    user = await _get_user_by_email(db, payload.email)
+    user = await user_repo.by_email(db, payload.email)
     if user is not None:
         if await _claim_reset(r, user.email):
             background.add_task(
@@ -302,7 +292,7 @@ async def reset_password(
     if await is_revoked(r, claims["jti"]):
         raise _INVALID_RESET
 
-    user = await db.get(User, user_id)
+    user = await user_repo.get(db, user_id)
     if user is None:
         raise _INVALID_RESET
 
@@ -316,7 +306,7 @@ async def reset_password(
 
 @router.post("/register/helper", response_model=UserOut, status_code=status.HTTP_201_CREATED)
 async def register_helper(payload: HelperRegister, db: AsyncSession = Depends(get_db)) -> User:
-    if await _get_user_by_email(db, payload.email):
+    if await user_repo.by_email(db, payload.email):
         raise _EMAIL_TAKEN
 
     # Helper accounts are pending until an admin approves (spec §8).
@@ -352,7 +342,7 @@ async def verify_email(token: str = Query(...), db: AsyncSession = Depends(get_d
             status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired token"
         ) from exc
 
-    user = await db.get(User, user_id)
+    user = await user_repo.get(db, user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     if user.status == UserStatus.pending_email:
@@ -372,7 +362,7 @@ def _issue_pair(user: User) -> TokenPair:
 
 @router.post("/login", response_model=TokenPair)
 async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> TokenPair:
-    user = await _get_user_by_email(db, payload.email)
+    user = await user_repo.by_email(db, payload.email)
     if user is None:
         # Spend the same argon2 time as the found-user branch before failing, so
         # response latency does not reveal which addresses have accounts.
@@ -436,7 +426,7 @@ async def refresh(
         logger.warning("refresh token replay for user %s (jti=%s)", user_id, claims["jti"])
         raise _INVALID_REFRESH
 
-    user = await db.get(User, user_id)
+    user = await user_repo.get(db, user_id)
     if user is None or user.status != UserStatus.active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not active")
 
@@ -493,7 +483,7 @@ async def _me_response(user: User, db: AsyncSession) -> MeOut:
     """
     student: Student | None = None
     if user.role == UserRole.student:
-        student = await db.scalar(select(Student).where(Student.user_id == user.id))
+        student = await user_repo.student_by_user_id(db, user.id)
 
     return MeOut(
         id=user.id,

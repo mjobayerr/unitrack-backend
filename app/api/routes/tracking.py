@@ -18,14 +18,13 @@ from datetime import UTC, datetime, timedelta
 from elasticsearch import AsyncElasticsearch
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from redis.asyncio import Redis
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_authenticated
 from app.core.elasticsearch import GPS_INDEX, get_es
 from app.core.redis import bus_pos_key, bus_seats_key, get_redis, trip_eta_key
 from app.db.session import get_db
-from app.models.fleet import Bus, Route, RouteStop, Stop, Trip, TripStatus
+from app.repositories import fleet as fleet_repo
 from app.schemas.admin import GpsFreshness
 from app.schemas.gps import BusHistoryPathOut, GpsPoint
 from app.schemas.live_track import LiveFleetBus, LiveFleetOut
@@ -122,24 +121,7 @@ async def live_fleet(
     helper with a wrong clock still reads as live (see fleet_view.Position).
     """
     now = datetime.now(UTC)
-    rows = (
-        await db.execute(
-            select(
-                Trip.id,
-                Bus.id,
-                Bus.reg_no,
-                Bus.nickname,
-                Bus.capacity,
-                Route.id,
-                Route.name,
-                Route.direction,
-            )
-            .join(Bus, Bus.id == Trip.bus_id)
-            .join(Route, Route.id == Trip.route_id)
-            .where(Trip.status == TripStatus.live)
-            .order_by(Trip.actual_start)
-        )
-    ).all()
+    rows = await fleet_repo.live_trip_columns(db)
     if not rows:
         return LiveFleetOut(generated_at=now, total=0, live=0, stale=0, lost=0, buses=[])
 
@@ -308,7 +290,7 @@ async def stop_arrivals(
     Reads only Redis for the estimates themselves. Postgres is touched once, for
     the names, because "4 min" is useless without knowing which route it is on.
     """
-    stop = await db.get(Stop, stop_id)
+    stop = await fleet_repo.get_stop(db, stop_id)
     if stop is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown stop")
 
@@ -316,13 +298,7 @@ async def stop_arrivals(
 
     # Live trips whose route includes this stop. A trip on a route that does not
     # serve it can never arrive, so there is no point reading its estimate.
-    stmt = (
-        select(Trip.id, Trip.route_id, Trip.bus_id, Route.name)
-        .join(Route, Route.id == Trip.route_id)
-        .join(RouteStop, RouteStop.route_id == Route.id)
-        .where(Trip.status == TripStatus.live, RouteStop.stop_id == stop_id)
-    )
-    candidates = (await db.execute(stmt)).all()
+    candidates = await fleet_repo.live_trips_serving_stop(db, stop_id)
 
     arrivals: list[BusArrivalOut] = []
     for trip_id, route_id, bus_id, route_name in candidates:
@@ -385,7 +361,7 @@ async def get_bus_history_path(
         ?from_timestamp=2026-07-21T08:00:00Z&to_timestamp=2026-07-21T18:00:00Z
     """
 
-    bus = await db.get(Bus, bus_id)
+    bus = await fleet_repo.get_bus(db, bus_id)
     if bus is None:
         raise HTTPException(status_code=404, detail=f"Bus {bus_id} not found")
 
@@ -395,8 +371,7 @@ async def get_bus_history_path(
         )
 
     if trip_id:
-        stmt = select(Trip).where(Trip.id == trip_id, Trip.bus_id == bus_id)
-        trip = await db.scalar(stmt)
+        trip = await fleet_repo.trip_for_bus(db, trip_id, bus_id)
         if trip is None:
             raise HTTPException(
                 status_code=404, detail=f"Trip {trip_id} not found for bus {bus_id}"
