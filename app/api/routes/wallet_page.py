@@ -21,6 +21,8 @@ enough to delete without regret when that lands.
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse
 
+from app.core.config import API_V1_PREFIX
+
 router = APIRouter(tags=["wallet"])
 
 # The QR refreshes every 10s against a 30s slice with ±1 slice tolerance, so a
@@ -107,7 +109,7 @@ function login(message) {
   go.onclick = async () => {
     go.disabled = true;
     try {
-      const r = await fetch('/auth/login', {
+      const r = await fetch(API + '/auth/login', {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ email: e.value, password: p.value }),
       });
@@ -125,7 +127,7 @@ function login(message) {
 async function wallet() {
   stopRefresh();
   app.innerHTML = '<p class="muted">Loading…</p>';
-  const tickets = await api('/shop/tickets');
+  const tickets = await api(API + '/shop/tickets');
   if (!tickets) return;
 
   const active = tickets.filter(t => t.status === 'active');
@@ -165,11 +167,14 @@ function show(id) {
   const img = document.getElementById('qr');
   // Cache-buster: the browser would otherwise reuse the previous image and the
   // student would present a code from an expired slice.
-  const draw = () => { img.src = `/shop/tickets/${id}/qr.png?t=${Date.now()}`; };
+  const draw = () => { img.src = `${API}/shop/tickets/${id}/qr.png?t=${Date.now()}`; };
   draw();
   timer = setInterval(draw, REFRESH_MS);
 }
 
+// Both injected server-side so the page carries the real mounted paths and the
+// single version prefix from app/core/config.py — see wallet_page() below.
+const API = "__API__";
 const REFRESH_MS = __REFRESH_MS__;
 token ? wallet().catch(() => login()) : login();
 </script>
@@ -181,4 +186,6 @@ token ? wallet().catch(() => login()) : login();
 @router.get("/wallet", response_class=HTMLResponse, include_in_schema=False)
 async def wallet_page() -> HTMLResponse:
     """The page itself. Public — it authenticates from inside, like any SPA."""
-    return HTMLResponse(_PAGE.replace("__REFRESH_MS__", str(_REFRESH_MS)))
+    return HTMLResponse(
+        _PAGE.replace("__API__", API_V1_PREFIX).replace("__REFRESH_MS__", str(_REFRESH_MS))
+    )

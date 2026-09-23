@@ -21,7 +21,7 @@ def test_bus_track_returns_current_location_from_redis() -> None:
     app.dependency_overrides[bus_track_routes.get_redis] = fake_get_redis
 
     with TestClient(app) as client:
-        response = client.get("/bus-track", params={"bus_id": "bus-123"})
+        response = client.get("/api/v1/bus-track", params={"bus_id": "bus-123"})
 
     assert response.status_code == 200
     assert response.json() == {

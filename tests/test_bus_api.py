@@ -77,7 +77,7 @@ async def test_create_single_bus(app_with_db, in_memory_db: AsyncSession):
         transport=ASGITransport(app=app_with_db), base_url="http://test"
     ) as client:
         payload = {"reg_no": "BUS-001", "nickname": "Red Line", "capacity": 45}
-        response = await client.post("/admin/buses", json=payload)
+        response = await client.post("/api/v1/admin/buses", json=payload)
         assert response.status_code == status.HTTP_201_CREATED
         data = response.json()
         assert data["reg_no"] == "BUS-001"
@@ -87,7 +87,7 @@ async def test_create_single_bus(app_with_db, in_memory_db: AsyncSession):
         assert "id" in data
 
         # Duplicate reg_no should return 409
-        dup_response = await client.post("/admin/buses", json=payload)
+        dup_response = await client.post("/api/v1/admin/buses", json=payload)
         assert dup_response.status_code == status.HTTP_409_CONFLICT
 
 
@@ -103,7 +103,7 @@ async def test_create_bus_list(app_with_db, in_memory_db: AsyncSession):
             ]
         }
         # Test POST /admin/buses/batch
-        response = await client.post("/admin/buses/batch", json=payload)
+        response = await client.post("/api/v1/admin/buses/batch", json=payload)
         assert response.status_code == status.HTTP_201_CREATED
         data = response.json()
         assert len(data) == 2
@@ -123,7 +123,7 @@ async def test_create_bus_list(app_with_db, in_memory_db: AsyncSession):
                 {"reg_no": "BUS-202", "nickname": "Route B2"},
             ]
         }
-        alias_response = await client.post("/admin/buses/list", json=payload_alias)
+        alias_response = await client.post("/api/v1/admin/buses/list", json=payload_alias)
         assert alias_response.status_code == status.HTTP_201_CREATED
         assert len(alias_response.json()) == 2
 
@@ -140,16 +140,16 @@ async def test_create_bus_list_duplicates(app_with_db):
                 {"reg_no": "BUS-DUP", "nickname": "Bus 2"},
             ]
         }
-        res_400 = await client.post("/admin/buses/batch", json=payload_internal_dup)
+        res_400 = await client.post("/api/v1/admin/buses/batch", json=payload_internal_dup)
         assert res_400.status_code == status.HTTP_400_BAD_REQUEST
 
         # Already existing in DB -> 409
-        await client.post("/admin/buses", json={"reg_no": "BUS-EXISTING"})
+        await client.post("/api/v1/admin/buses", json={"reg_no": "BUS-EXISTING"})
         payload_existing_dup = {
             "buses": [
                 {"reg_no": "BUS-EXISTING", "nickname": "Existing Bus"},
                 {"reg_no": "BUS-NEW", "nickname": "New Bus"},
             ]
         }
-        res_409 = await client.post("/admin/buses/batch", json=payload_existing_dup)
+        res_409 = await client.post("/api/v1/admin/buses/batch", json=payload_existing_dup)
         assert res_409.status_code == status.HTTP_409_CONFLICT

@@ -179,7 +179,7 @@ def _client_with_redis(redis: _FakeRedis) -> TestClient:
 def test_ws_rejects_missing_token() -> None:
     client = _client_with_redis(_FakeRedis([]))
     with pytest.raises(WebSocketDisconnect) as exc:
-        with client.websocket_connect(f"/ws/track/{ROUTE_ID}"):
+        with client.websocket_connect(f"/api/v1/ws/track/{ROUTE_ID}"):
             pass
     assert exc.value.code == ws_track.WS_UNAUTHORIZED
 
@@ -187,7 +187,7 @@ def test_ws_rejects_missing_token() -> None:
 def test_ws_rejects_invalid_token() -> None:
     client = _client_with_redis(_FakeRedis([]))
     with pytest.raises(WebSocketDisconnect) as exc:
-        with client.websocket_connect(f"/ws/track/{ROUTE_ID}?token=not-a-jwt"):
+        with client.websocket_connect(f"/api/v1/ws/track/{ROUTE_ID}?token=not-a-jwt"):
             pass
     assert exc.value.code == ws_track.WS_UNAUTHORIZED
 
@@ -198,7 +198,7 @@ def test_ws_rejects_unknown_route(monkeypatch: pytest.MonkeyPatch) -> None:
 
     client = _client_with_redis(_FakeRedis([], principal_json=principal_json))
     with pytest.raises(WebSocketDisconnect) as exc:
-        with client.websocket_connect(f"/ws/track/{ROUTE_ID}?token={token}"):
+        with client.websocket_connect(f"/api/v1/ws/track/{ROUTE_ID}?token={token}"):
             pass
     assert exc.value.code == ws_track.WS_ROUTE_NOT_FOUND
 
@@ -217,7 +217,7 @@ def test_ws_streams_a_frame_for_a_valid_token(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(live_track.roster_cache, "get", _async_return([ref]))
 
     client = _client_with_redis(redis)
-    with client.websocket_connect(f"/ws/track/{ROUTE_ID}?token={token}") as ws:
+    with client.websocket_connect(f"/api/v1/ws/track/{ROUTE_ID}?token={token}") as ws:
         frame = ws.receive_json()
 
     assert frame["type"] == "positions"

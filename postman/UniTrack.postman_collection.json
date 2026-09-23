@@ -45,11 +45,13 @@
               }
             ],
             "url": {
-              "raw": "{{base_url}}/auth/register/student",
+              "raw": "{{base_url}}/api/v1/auth/register/student",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "auth",
                 "register",
                 "student"
@@ -79,11 +81,13 @@
               }
             ],
             "url": {
-              "raw": "{{base_url}}/auth/register/helper",
+              "raw": "{{base_url}}/api/v1/auth/register/helper",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "auth",
                 "register",
                 "helper"
@@ -108,11 +112,13 @@
             "method": "GET",
             "header": [],
             "url": {
-              "raw": "{{base_url}}/auth/verify-email",
+              "raw": "{{base_url}}/api/v1/auth/verify-email",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "auth",
                 "verify-email"
               ],
@@ -140,11 +146,13 @@
               }
             ],
             "url": {
-              "raw": "{{base_url}}/auth/login",
+              "raw": "{{base_url}}/api/v1/auth/login",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "auth",
                 "login"
               ]
@@ -184,11 +192,13 @@
               }
             ],
             "url": {
-              "raw": "{{base_url}}/auth/refresh",
+              "raw": "{{base_url}}/api/v1/auth/refresh",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "auth",
                 "refresh"
               ]
@@ -212,11 +222,13 @@
             "method": "GET",
             "header": [],
             "url": {
-              "raw": "{{base_url}}/auth/me",
+              "raw": "{{base_url}}/api/v1/auth/me",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "auth",
                 "me"
               ]
@@ -247,11 +259,13 @@
             "method": "GET",
             "header": [],
             "url": {
-              "raw": "{{base_url}}/admin/helpers",
+              "raw": "{{base_url}}/api/v1/admin/helpers",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "admin",
                 "helpers"
               ],
@@ -284,11 +298,13 @@
             "method": "POST",
             "header": [],
             "url": {
-              "raw": "{{base_url}}/admin/helpers/{helper_id}/approve",
+              "raw": "{{base_url}}/api/v1/admin/helpers/{helper_id}/approve",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "admin",
                 "helpers",
                 "{helper_id}",
@@ -315,11 +331,13 @@
             "method": "POST",
             "header": [],
             "url": {
-              "raw": "{{base_url}}/admin/users/{user_id}/suspend",
+              "raw": "{{base_url}}/api/v1/admin/users/{user_id}/suspend",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "admin",
                 "users",
                 "{user_id}",
@@ -346,11 +364,13 @@
             "method": "GET",
             "header": [],
             "url": {
-              "raw": "{{base_url}}/admin/alerts",
+              "raw": "{{base_url}}/api/v1/admin/alerts",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "admin",
                 "alerts"
               ],
@@ -389,11 +409,13 @@
             "method": "POST",
             "header": [],
             "url": {
-              "raw": "{{base_url}}/admin/alerts/{alert_id}/acknowledge",
+              "raw": "{{base_url}}/api/v1/admin/alerts/{alert_id}/acknowledge",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "admin",
                 "alerts",
                 "{alert_id}",
@@ -425,11 +447,13 @@
               }
             ],
             "url": {
-              "raw": "{{base_url}}/admin/alerts/{alert_id}/resolve",
+              "raw": "{{base_url}}/api/v1/admin/alerts/{alert_id}/resolve",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "admin",
                 "alerts",
                 "{alert_id}",
@@ -470,11 +494,13 @@
               }
             ],
             "url": {
-              "raw": "{{base_url}}/admin/buses",
+              "raw": "{{base_url}}/api/v1/admin/buses",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "admin",
                 "buses"
               ]
@@ -513,11 +539,13 @@
               }
             ],
             "url": {
-              "raw": "{{base_url}}/admin/buses/list",
+              "raw": "{{base_url}}/api/v1/admin/buses/list",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "admin",
                 "buses",
                 "list"
@@ -557,11 +585,13 @@
               }
             ],
             "url": {
-              "raw": "{{base_url}}/admin/buses/batch",
+              "raw": "{{base_url}}/api/v1/admin/buses/batch",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "admin",
                 "buses",
                 "batch"
@@ -602,11 +632,13 @@
             "method": "GET",
             "header": [],
             "url": {
-              "raw": "{{base_url}}/fleet/buses",
+              "raw": "{{base_url}}/api/v1/fleet/buses",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "fleet",
                 "buses"
               ],
@@ -639,11 +671,13 @@
             "method": "GET",
             "header": [],
             "url": {
-              "raw": "{{base_url}}/fleet/routes",
+              "raw": "{{base_url}}/api/v1/fleet/routes",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "fleet",
                 "routes"
               ],
@@ -676,11 +710,13 @@
             "method": "GET",
             "header": [],
             "url": {
-              "raw": "{{base_url}}/fleet/routes/{route_id}",
+              "raw": "{{base_url}}/api/v1/fleet/routes/{route_id}",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "fleet",
                 "routes",
                 "{route_id}"
@@ -706,11 +742,13 @@
             "method": "GET",
             "header": [],
             "url": {
-              "raw": "{{base_url}}/fleet/stops",
+              "raw": "{{base_url}}/api/v1/fleet/stops",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "fleet",
                 "stops"
               ]
@@ -746,11 +784,13 @@
               }
             ],
             "url": {
-              "raw": "{{base_url}}/helper/trips/start",
+              "raw": "{{base_url}}/api/v1/helper/trips/start",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "helper",
                 "trips",
                 "start"
@@ -785,11 +825,13 @@
             "method": "POST",
             "header": [],
             "url": {
-              "raw": "{{base_url}}/helper/trips/end",
+              "raw": "{{base_url}}/api/v1/helper/trips/end",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "helper",
                 "trips",
                 "end"
@@ -815,11 +857,13 @@
             "method": "GET",
             "header": [],
             "url": {
-              "raw": "{{base_url}}/helper/trips/active",
+              "raw": "{{base_url}}/api/v1/helper/trips/active",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "helper",
                 "trips",
                 "active"
@@ -850,11 +894,13 @@
               }
             ],
             "url": {
-              "raw": "{{base_url}}/helper/seats",
+              "raw": "{{base_url}}/api/v1/helper/seats",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "helper",
                 "seats"
               ]
@@ -893,11 +939,13 @@
               }
             ],
             "url": {
-              "raw": "{{base_url}}/helper/alerts",
+              "raw": "{{base_url}}/api/v1/helper/alerts",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "helper",
                 "alerts"
               ]
@@ -936,11 +984,13 @@
               }
             ],
             "url": {
-              "raw": "{{base_url}}/helper/gps",
+              "raw": "{{base_url}}/api/v1/helper/gps",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "helper",
                 "gps"
               ]
@@ -980,11 +1030,13 @@
             "method": "GET",
             "header": [],
             "url": {
-              "raw": "{{base_url}}/track/nearby",
+              "raw": "{{base_url}}/api/v1/track/nearby",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
+                "api",
+                "v1",
                 "track",
                 "nearby"
               ],

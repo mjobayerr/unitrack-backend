@@ -2,6 +2,15 @@ from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# The single version prefix the whole API is mounted under (see
+# app/api/routes/__init__.py). A module constant rather than a Settings field
+# because it is a code-level contract, not something a deployment retunes: every
+# client is generated against it, so changing it is a new API version, not an
+# env var. Lives in this leaf module so any layer can build a matching URL — the
+# SSLCommerz callbacks in shop.py, the wallet page's own fetches — without an
+# import cycle through the routes package.
+API_V1_PREFIX = "/api/v1"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")

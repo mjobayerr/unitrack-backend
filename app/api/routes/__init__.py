@@ -28,6 +28,7 @@ from app.api.routes import (
     wallet_page,
     ws_track,
 )
+from app.core.config import API_V1_PREFIX
 
 # Every router in the API. `api_router` is built from this tuple rather than
 # from a list of include_router() calls, so the auth-coverage test and the
@@ -49,12 +50,28 @@ ROUTERS: tuple[APIRouter, ...] = (
     ws_track.router,
 )
 
-api_router = APIRouter()
+# The whole API is served under a single version prefix, so a future breaking
+# change can ship as `/api/v2/...` alongside `/api/v1/...` rather than breaking
+# every deployed client (the helper app, the web app, the generated TS client)
+# at once. Applied once here on the aggregator — every included router inherits
+# it and app/main.py stays a one-line include.
+#
+# `/health` is mounted on the app itself in app/main.py, OUTSIDE this router, so
+# the liveness probe nginx and docker-compose hit stays at `/health`,
+# unversioned. Any in-app URL that must match a route — the SSLCommerz callbacks
+# in shop.py, the wallet page's own fetches — is built from this same constant,
+# which lives in app/core/config.py so importing it here creates no cycle.
+api_router = APIRouter(prefix=API_V1_PREFIX)
 for _router in ROUTERS:
     api_router.include_router(_router)
 
 # Routes that are unauthenticated **by design**. Every entry needs a reason,
 # because every entry is an attack surface.
+#
+# Written as the logical path WITHOUT `API_V1_PREFIX` — the path as declared on
+# its router. `tests/test_auth_coverage.py` compares these against the
+# router-level paths (which carry no mount prefix), and strips the prefix back
+# off the mounted paths when it reads openapi.json.
 PUBLIC_PATHS: frozenset[str] = frozenset(
     {
         "/health",  # liveness probe for nginx/compose — must work without creds

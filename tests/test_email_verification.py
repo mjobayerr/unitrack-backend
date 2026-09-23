@@ -87,7 +87,7 @@ async def _user(db: AsyncSession, email: str) -> User | None:
 
 
 async def test_a_varsity_address_can_register(client, db) -> None:
-    response = await client.post("/auth/register/student", json=REGISTRATION)
+    response = await client.post("/api/v1/auth/register/student", json=REGISTRATION)
     assert response.status_code == status.HTTP_201_CREATED
     assert response.json()["status"] == "pending_email"
 
@@ -99,7 +99,7 @@ async def test_a_varsity_address_can_register(client, db) -> None:
 async def test_an_outside_address_is_refused_by_the_server(client) -> None:
     """The gate is server-side, not a UI hint. A form is trivially bypassed."""
     response = await client.post(
-        "/auth/register/student", json={**REGISTRATION, "email": "someone@gmail.com"}
+        "/api/v1/auth/register/student", json={**REGISTRATION, "email": "someone@gmail.com"}
     )
     assert response.status_code == status.HTTP_403_FORBIDDEN
 
@@ -110,14 +110,15 @@ async def test_a_lookalike_domain_is_refused(client) -> None:
     than a way in."""
     for bad in ("a@ulab.edu.bd.evil.com", "a@notulab.edu.bd", "a@sub.ulab.edu.bd"):
         response = await client.post(
-            "/auth/register/student", json={**REGISTRATION, "email": bad}
+            "/api/v1/auth/register/student", json={**REGISTRATION, "email": bad}
         )
         assert response.status_code == status.HTTP_403_FORBIDDEN, bad
 
 
 async def test_the_same_address_cannot_be_registered_twice(client) -> None:
-    assert (await client.post("/auth/register/student", json=REGISTRATION)).status_code == 201
-    second = await client.post("/auth/register/student", json=REGISTRATION)
+    first = await client.post("/api/v1/auth/register/student", json=REGISTRATION)
+    assert first.status_code == 201
+    second = await client.post("/api/v1/auth/register/student", json=REGISTRATION)
     assert second.status_code == status.HTTP_409_CONFLICT
 
 
@@ -125,17 +126,17 @@ async def test_the_same_address_cannot_be_registered_twice(client) -> None:
 
 
 async def test_registration_sends_a_link_to_the_address_given(client, sent) -> None:
-    await client.post("/auth/register/student", json=REGISTRATION)
+    await client.post("/api/v1/auth/register/student", json=REGISTRATION)
     assert len(sent) == 1
     assert sent[0]["to"] == "new.student@ulab.edu.bd"
 
 
 async def test_an_unconfirmed_account_cannot_log_in(client) -> None:
     """The whole point of confirmation. Registering must not be enough."""
-    await client.post("/auth/register/student", json=REGISTRATION)
+    await client.post("/api/v1/auth/register/student", json=REGISTRATION)
 
     response = await client.post(
-        "/auth/login",
+        "/api/v1/auth/login",
         json={"email": REGISTRATION["email"], "password": REGISTRATION["password"]},
     )
     assert response.status_code == status.HTTP_403_FORBIDDEN
@@ -145,16 +146,16 @@ async def test_an_unconfirmed_account_cannot_log_in(client) -> None:
 
 
 async def test_clicking_the_link_activates_and_then_login_works(client, sent) -> None:
-    await client.post("/auth/register/student", json=REGISTRATION)
+    await client.post("/api/v1/auth/register/student", json=REGISTRATION)
 
     verified = await client.get(
-        "/auth/verify-email", params={"token": sent[0]["token"]}
+        "/api/v1/auth/verify-email", params={"token": sent[0]["token"]}
     )
     assert verified.status_code == status.HTTP_200_OK
     assert verified.json()["status"] == "active"
 
     login = await client.post(
-        "/auth/login",
+        "/api/v1/auth/login",
         json={"email": REGISTRATION["email"], "password": REGISTRATION["password"]},
     )
     assert login.status_code == status.HTTP_200_OK
@@ -162,10 +163,10 @@ async def test_clicking_the_link_activates_and_then_login_works(client, sent) ->
 
 
 async def test_a_forged_or_expired_token_activates_nothing(client, db) -> None:
-    await client.post("/auth/register/student", json=REGISTRATION)
+    await client.post("/api/v1/auth/register/student", json=REGISTRATION)
 
     for bad in ("not-a-token", create_email_verify_token(str(uuid.uuid4()), "student")):
-        response = await client.get("/auth/verify-email", params={"token": bad})
+        response = await client.get("/api/v1/auth/verify-email", params={"token": bad})
         assert response.status_code in (
             status.HTTP_400_BAD_REQUEST,
             status.HTTP_404_NOT_FOUND,
@@ -181,9 +182,9 @@ async def test_an_access_token_is_not_a_verification_token(client) -> None:
     signed would activate an account."""
     from app.core.security import create_access_token
 
-    await client.post("/auth/register/student", json=REGISTRATION)
+    await client.post("/api/v1/auth/register/student", json=REGISTRATION)
     response = await client.get(
-        "/auth/verify-email",
+        "/api/v1/auth/verify-email",
         params={"token": create_access_token(str(uuid.uuid4()), "student")},
     )
     assert response.status_code == status.HTTP_400_BAD_REQUEST
@@ -191,11 +192,11 @@ async def test_an_access_token_is_not_a_verification_token(client) -> None:
 
 async def test_confirming_twice_is_harmless(client, sent) -> None:
     """People click links twice, and mail scanners click them once first."""
-    await client.post("/auth/register/student", json=REGISTRATION)
+    await client.post("/api/v1/auth/register/student", json=REGISTRATION)
     token = sent[0]["token"]
 
-    first = await client.get("/auth/verify-email", params={"token": token})
-    second = await client.get("/auth/verify-email", params={"token": token})
+    first = await client.get("/api/v1/auth/verify-email", params={"token": token})
+    second = await client.get("/api/v1/auth/verify-email", params={"token": token})
     assert first.status_code == second.status_code == status.HTTP_200_OK
     assert second.json()["status"] == "active"
 
@@ -206,11 +207,11 @@ async def test_confirming_twice_is_harmless(client, sent) -> None:
 async def test_a_lost_email_can_be_resent(client, sent) -> None:
     """Otherwise one spam filter is an account its owner can never use and
     never re-register, because the address is already taken."""
-    await client.post("/auth/register/student", json=REGISTRATION)
+    await client.post("/api/v1/auth/register/student", json=REGISTRATION)
     sent.clear()
 
     response = await client.post(
-        "/auth/resend-verification", json={"email": REGISTRATION["email"]}
+        "/api/v1/auth/resend-verification", json={"email": REGISTRATION["email"]}
     )
     assert response.status_code == status.HTTP_202_ACCEPTED
     assert len(sent) == 1
@@ -221,14 +222,14 @@ async def test_resend_answers_identically_for_an_address_that_does_not_exist(
 ) -> None:
     """Unauthenticated, so a different answer here would let anyone enumerate
     who at the university holds an account."""
-    await client.post("/auth/register/student", json=REGISTRATION)
+    await client.post("/api/v1/auth/register/student", json=REGISTRATION)
     sent.clear()
 
     real = await client.post(
-        "/auth/resend-verification", json={"email": REGISTRATION["email"]}
+        "/api/v1/auth/resend-verification", json={"email": REGISTRATION["email"]}
     )
     fake = await client.post(
-        "/auth/resend-verification", json={"email": "nobody@ulab.edu.bd"}
+        "/api/v1/auth/resend-verification", json={"email": "nobody@ulab.edu.bd"}
     )
 
     assert real.status_code == fake.status_code == status.HTTP_202_ACCEPTED
@@ -239,12 +240,12 @@ async def test_resend_answers_identically_for_an_address_that_does_not_exist(
 
 
 async def test_resend_does_nothing_for_an_already_active_account(client, sent, db) -> None:
-    await client.post("/auth/register/student", json=REGISTRATION)
-    await client.get("/auth/verify-email", params={"token": sent[0]["token"]})
+    await client.post("/api/v1/auth/register/student", json=REGISTRATION)
+    await client.get("/api/v1/auth/verify-email", params={"token": sent[0]["token"]})
     sent.clear()
 
     response = await client.post(
-        "/auth/resend-verification", json={"email": REGISTRATION["email"]}
+        "/api/v1/auth/resend-verification", json={"email": REGISTRATION["email"]}
     )
     assert response.status_code == status.HTTP_202_ACCEPTED
     assert sent == []
